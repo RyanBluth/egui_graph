@@ -707,6 +707,28 @@ impl<'a> NodeCtx<'a> {
         frame: egui::Frame,
         content: impl FnOnce(&mut egui::Ui, &mut crate::SocketLayout) -> T,
     ) -> FramedResponse<T> {
+        self.framed_with_content_enabled(frame, false, content)
+    }
+
+    /// Show content within a custom frame while keeping embedded controls enabled
+    /// when the graph structure is immutable.
+    ///
+    /// This is useful for editors whose node graph topology is read-only but whose
+    /// node parameters remain directly editable.
+    pub fn framed_with_interactive<T>(
+        self,
+        frame: egui::Frame,
+        content: impl FnOnce(&mut egui::Ui, &mut crate::SocketLayout) -> T,
+    ) -> FramedResponse<T> {
+        self.framed_with_content_enabled(frame, true, content)
+    }
+
+    fn framed_with_content_enabled<T>(
+        self,
+        frame: egui::Frame,
+        content_enabled_when_immutable: bool,
+        content: impl FnOnce(&mut egui::Ui, &mut crate::SocketLayout) -> T,
+    ) -> FramedResponse<T> {
         let min_size = self.min_size;
         let immutable = self.immutable;
         let mut socket_layout =
@@ -717,7 +739,7 @@ impl<'a> NodeCtx<'a> {
                 ui.set_min_size(min_size);
                 // Disable content widgets when immutable (inside the frame
                 // so that the frame itself retains normal styling).
-                if immutable {
+                if immutable && !content_enabled_when_immutable {
                     ui.disable();
                 }
                 content(ui, &mut socket_layout)

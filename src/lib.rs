@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "layout")]
@@ -1426,7 +1426,10 @@ fn paint_selection_area(sel_rect: egui::Rect, ui: &mut egui::Ui) {
 
 /// Combines the given id src with the `TypeId` of the `Graph` to produce a unique `egui::Id`.
 pub fn id(id_src: impl Hash) -> egui::Id {
-    egui::Id::new((std::any::TypeId::of::<Graph>(), id_src))
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::any::TypeId::of::<Graph>().hash(&mut hasher);
+    id_src.hash(&mut hasher);
+    egui::Id::new(hasher.finish())
 }
 
 /// Access the graph's temporary memory for the given graph ID.
