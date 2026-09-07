@@ -41,6 +41,9 @@ pub struct Graph {
     /// structural changes - node positions, edges, and node content remain
     /// view-only while navigation and selection continue to work.
     immutable: bool,
+    selection_enabled: bool,
+    scroll_zoom: bool,
+    drag_pan_buttons: egui::containers::DragPanButtons,
     /// How node positions and frame sizes are snapped to whole graph-space
     /// units, or `None` to disable snapping.
     snap: Option<Snap>,
@@ -250,6 +253,7 @@ pub type Layout = HashMap<NodeId, egui::Pos2>;
 
 /// The context returned by the `Graph` widget. Allows for setting nodes and edges.
 pub struct Show<'a> {
+    selection_enabled: bool,
     /// Useful for accessing the `GraphTempMemory`.
     graph_id: egui::Id,
     /// The full area covered by the `Graph` within the UI.
@@ -285,6 +289,7 @@ pub struct NodeSockets {
 
 /// A context to assist with the instantiation of node widgets.
 pub struct NodesCtx<'a> {
+    pub selection_enabled: bool,
     pub graph_id: egui::Id,
     graph_rect: egui::Rect,
     selection_rect: Option<egui::Rect>,
@@ -302,6 +307,7 @@ pub struct NodesCtx<'a> {
 
 /// A context to assist with the instantiation of edge widgets.
 pub struct EdgesCtx {
+    pub selection_enabled: bool,
     graph_id: egui::Id,
     graph_rect: egui::Rect,
     selection_rect: Option<egui::Rect>,
@@ -382,6 +388,9 @@ impl Graph {
             id,
             selected_nodes: None,
             immutable: false,
+            selection_enabled: true,
+            scroll_zoom: false,
+            drag_pan_buttons: egui::containers::DragPanButtons::MIDDLE,
             snap: Self::DEFAULT_SNAP,
             snap_step: Self::DEFAULT_SNAP_STEP,
             align: Self::DEFAULT_ALIGN,
@@ -474,6 +483,28 @@ impl Graph {
     /// Default: `false`.
     pub fn immutable(mut self, immutable: bool) -> Self {
         self.immutable = immutable;
+        self
+    }
+
+    /// Enable node, edge, and box selection (enabled by default).
+    ///
+    /// Disabling selection clears existing selections and prevents node dragging.
+    /// Panning, zooming, embedded controls, and socket connections remain available.
+    pub fn selection_enabled(mut self, enabled: bool) -> Self {
+        self.selection_enabled = enabled;
+        self
+    }
+
+    /// Zoom with unmodified scrolling instead of scrolling to pan.
+    pub fn scroll_zoom(mut self, enabled: bool) -> Self {
+        self.scroll_zoom = enabled;
+        self
+    }
+
+    /// Pointer buttons that pan the background. Defaults to middle-drag.
+    /// Disable selection when enabling primary-button panning.
+    pub fn drag_pan_buttons(mut self, buttons: egui::containers::DragPanButtons) -> Self {
+        self.drag_pan_buttons = buttons;
         self
     }
 
@@ -615,7 +646,7 @@ impl Graph {
         // Create the Scene.
         let mut scene = egui::containers::Scene::new()
             .zoom_range(self.zoom_range)
-            .drag_pan_buttons(egui::containers::DragPanButtons::MIDDLE);
+            .drag_pan_buttons(self.drag_pan_buttons);
         if let Some(max_inner_size) = self.max_inner_size {
             scene = scene.max_inner_size(max_inner_size);
         }
@@ -623,7 +654,14 @@ impl Graph {
         // Track the bounding area of all widgets in the scene.
         let mut bounding_rect = None;
 
-        let scene_response = scene.show(ui, scene_rect, |ui| {
+        // Suppress Scene's scroll-to-pan, but restore scrolling for embedded widgets.
+        let scroll = self
+            .scroll_zoom
+            .then(|| ui.input_mut(|input| std::mem::take(&mut input.smooth_scroll_delta)));
+        let mut scene_response = scene.show(ui, scene_rect, |ui| {
+            if let Some(scroll) = scroll {
+                ui.input_mut(|input| input.smooth_scroll_delta = scroll);
+            }
             // Draw the selection rectangle if there is one.
             let mut selection_rect = None;
             let mut select = false;
@@ -647,6 +685,17 @@ impl Graph {
 
             // Reset the selection dirty flag for this frame.
             gmem.selection.changed = false;
+            if !self.selection_enabled {
+                gmem.selection.changed = !gmem.selection.nodes.is_empty();
+                gmem.selection.nodes.clear();
+                if gmem
+                    .pressed
+                    .as_ref()
+                    .is_some_and(|pressed| !matches!(pressed.action, PressAction::Socket(_)))
+                {
+                    gmem.pressed = None;
+                }
+            }
 
             // Take the previous frame's "pointer over a node frame" flag (it is
             // re-accumulated from each node's `contains_pointer()` as the nodes
@@ -686,7 +735,7 @@ impl Graph {
                     if self.immutable { None } else { closest_socket };
 
                 // Check for graph interactions.
-                let interaction = graph_interaction(
+                let mut interaction = graph_interaction(
                     layout,
                     &pointer,
                     closest_socket_for_interaction,
@@ -694,6 +743,16 @@ impl Graph {
                     ptr_graph,
                     gmem.pressed.as_ref(),
                 );
+                if !self.selection_enabled {
+                    interaction.select = false;
+                    interaction.selection_rect = None;
+                    interaction.drag_nodes_delta = egui::Vec2::ZERO;
+                    if interaction.pressed.as_ref().is_some_and(|pressed| {
+                        !matches!(pressed.action, PressAction::Socket(_))
+                    }) {
+                        interaction.pressed = None;
+                    }
+                }
 
                 // Move all selected nodes by a single delta (skip when
                 // immutable), keeping the group rigid (preserving its relative
@@ -859,6 +918,7 @@ impl Graph {
             let mut visited = HashSet::default();
 
             let show = Show {
+                selection_enabled: self.selection_enabled,
                 graph_id: self.id,
                 graph_rect,
                 selection_rect,
@@ -891,6 +951,43 @@ impl Graph {
 
             (output, selection_changed)
         });
+
+        let pointer_over_node = self.scroll_zoom
+            && {
+                let gmem_arc = memory(ui, self.id);
+                let gmem = gmem_arc.lock().expect("failed to lock graph temp memory");
+                gmem.ptr_over_node
+            };
+        if self.scroll_zoom && (scene_response.response.contains_pointer() || pointer_over_node) {
+            let delta = ui.input_mut(|input| std::mem::take(&mut input.smooth_scroll_delta));
+            if delta.y != 0.0 {
+                if let (Some(pointer), Some(transform)) = (
+                    ui.input(|input| input.pointer.hover_pos()),
+                    ui.ctx()
+                        .layer_transform_to_global(scene_response.response.layer_id),
+                ) {
+                    let speed = ui
+                        .ctx()
+                        .options(|options| options.input_options.scroll_zoom_speed);
+                    let factor = (delta.y * speed).exp().clamp(
+                        self.zoom_range.min / transform.scaling,
+                        self.zoom_range.max / transform.scaling,
+                    );
+                    let parent_transform = ui
+                        .ctx()
+                        .layer_transform_to_global(ui.layer_id())
+                        .unwrap_or_default();
+                    let visible = transform.inverse() * (parent_transform * graph_rect);
+                    let anchor = transform.inverse() * pointer;
+                    *scene_rect = egui::Rect::from_min_max(
+                        anchor + (visible.min - anchor) / factor,
+                        anchor + (visible.max - anchor) / factor,
+                    );
+                    scene_response.response.mark_changed();
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
 
         if self.center_view {
             if let Some(rect) = bounding_rect {
@@ -995,6 +1092,7 @@ impl<'a> Show<'a> {
                 ..
             } = self;
             let mut ctx = NodesCtx {
+                selection_enabled: self.selection_enabled,
                 graph_id,
                 graph_rect,
                 selection_rect,
@@ -1027,6 +1125,7 @@ impl<'a> Show<'a> {
                 ..
             } = self;
             let mut ctx = EdgesCtx {
+                selection_enabled: self.selection_enabled,
                 graph_id,
                 graph_rect,
                 selection_rect,

@@ -415,7 +415,10 @@ impl Node {
 
             // If the window is pressed, select the node.
             let pointer = &ui.input(|i| i.pointer.clone());
-            if response.is_pointer_button_down_on() && pointer.primary_pressed() {
+            if ctx.selection_enabled
+                && response.is_pointer_button_down_on()
+                && pointer.primary_pressed()
+            {
                 // If ctrl is down, check for deselection.
                 let was_selected = gmem.selection.nodes.contains(&self.id);
                 if ctrl_down && was_selected {

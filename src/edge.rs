@@ -233,7 +233,9 @@ impl<'a> Edge<'a> {
 
         // Handle selection state changes.
         let old_selected = *selected;
-        if *selected {
+        if !ectx.selection_enabled {
+            *selected = false;
+        } else if *selected {
             // Deselect if: edge drawing started, ctrl+click, or click elsewhere without ctrl.
             if edge_in_progress
                 || (clicked && ui.input(|i| i.modifiers.ctrl))
