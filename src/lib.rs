@@ -1,3 +1,6 @@
+// The README examples use the automatic layout.
+#![cfg_attr(feature = "layout", doc = include_str!("../README.md"))]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
@@ -30,6 +33,9 @@ pub struct Graph {
     center_view: bool,
     /// How the view responds when the available viewport size changes.
     resize_behavior: ResizeBehavior,
+    /// How the view pans while a drag holds the pointer near the edge of the
+    /// graph area, or `None` to disable it.
+    auto_pan: Option<AutoPan>,
     id: egui::Id,
     /// If set, overwrite the graph's selected nodes at the start of the frame.
     selected_nodes: Option<HashSet<NodeId>>,
@@ -80,6 +86,22 @@ pub enum ResizeBehavior {
     ///
     /// [`Scene`]: egui::containers::Scene
     MaintainView,
+}
+
+/// How the view pans while a drag holds the pointer near the edge of the
+/// graph area. See [`Graph::auto_pan`].
+///
+/// On each axis, the pan speed grows linearly from zero at `margin` pixels
+/// inside an edge to `max_speed` at the edge and beyond.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct AutoPan {
+    /// The width of the band along each edge of the graph area within which
+    /// the view pans, in screen pixels.
+    pub margin: f32,
+    /// The pan speed with the pointer at or past an edge, in screen pixels
+    /// per second.
+    pub max_speed: f32,
 }
 
 /// How node positions and frame sizes are snapped to whole graph-space units.
@@ -149,6 +171,11 @@ pub struct GraphTempMemory {
     /// Primarily used to check for node selection, as we don't know the size of the node until the
     /// contents have been instantiated.
     node_sizes: NodeSizes,
+    /// The position of each node when its size was recorded.
+    ///
+    /// Used to move the recorded sockets of a node that moves while out of
+    /// view, as it does not resolve its sockets again.
+    node_positions: HashMap<NodeId, egui::Pos2>,
     /// The currently selected nodes and edges.
     selection: Selection,
     /// Whether or not the primary button was pressed on the graph area and is still down.
@@ -159,16 +186,17 @@ pub struct GraphTempMemory {
     ///
     /// This is used to provide the position and normal of each socket when instantiating edges.
     sockets: HashMap<NodeId, NodeSockets>,
-    /// The socket that is currently closest to the mouse.
+    /// The closest socket that the pointer can press or connect to.
     ///
-    /// Always `Some` while the pointer is over the graph area, `None` otherwise.
+    /// Over a node frame, this is `Some` only while an edge is in progress, as
+    /// a press there drags the node. Always `None` when the graph is immutable.
     closest_socket: Option<socket::Socket>,
     /// Whether the pointer was over any node frame during the previous frame.
     ///
     /// Node frames are sublayers that win egui's hit-test over the scene, so the
     /// scene response reports "not hovered" while the pointer is over a node.
-    /// This lets socket detection still treat node frames as part of the graph
-    /// (e.g. releasing an edge over a socket that straddles a frame edge).
+    /// This lets an edge in progress still connect to a socket from within its
+    /// node frame (e.g. on release over a socket that straddles a frame edge).
     ptr_over_node: bool,
     /// The most recently observed available viewport size.
     ///
@@ -262,7 +290,7 @@ pub struct Show<'a> {
     selection_rect: Option<egui::Rect>,
     /// Whether or not the primary mouse button was just released to perform the selection.
     select: bool,
-    /// The closest socket within pressable range of the pointer.
+    /// The closest socket that the pointer can press or connect to.
     closest_socket: Option<socket::Socket>,
     /// Whether or not the primary mouse button was just released to end edge creation.
     socket_press_released: Option<socket::Socket>,
@@ -312,6 +340,10 @@ pub struct EdgesCtx {
     graph_rect: egui::Rect,
     selection_rect: Option<egui::Rect>,
     closest_socket: Option<socket::Socket>,
+    /// Whether an edge is in progress. Found once for all edges of the frame.
+    edge_in_progress: bool,
+    /// The graph's temporary memory. Fetched once for all edges of the frame.
+    memory: Arc<Mutex<GraphTempMemory>>,
     /// Whether the graph is in immutable (view-only) mode.
     pub immutable: bool,
 }
@@ -324,6 +356,8 @@ struct GraphInteraction {
     select: bool,
     selection_rect: Option<egui::Rect>,
     drag_nodes_delta: egui::Vec2,
+    /// The pressed node of a node drag that ended this update.
+    drag_released: Option<PressedNode>,
 }
 
 /// The response returned by [`Graph::show`].
@@ -334,6 +368,14 @@ pub struct GraphResponse<R> {
     pub response: egui::Response,
     /// The set of selected nodes, present only when the selection changed this frame.
     pub selection_changed: Option<HashSet<NodeId>>,
+    /// Whether a drag of the selected nodes ended this frame with the nodes in
+    /// a new position.
+    ///
+    /// This is `true` only on the frame the drag ends. A press and release in
+    /// place, or a drag back to the start, leaves it `false`. Use it to tell a
+    /// move by the user from layout changes the graph makes itself, such as
+    /// snapping or placing a node that has no position.
+    pub nodes_moved: bool,
 }
 
 impl Graph {
@@ -348,6 +390,8 @@ impl Graph {
     pub const DEFAULT_CENTER_VIEW: bool = false;
     /// The default [`ResizeBehavior`].
     pub const DEFAULT_RESIZE_BEHAVIOR: ResizeBehavior = ResizeBehavior::MaintainZoom;
+    /// The default [`AutoPan`]. Auto-pan is enabled by default.
+    pub const DEFAULT_AUTO_PAN: Option<AutoPan> = Some(AutoPan::DEFAULT);
     /// The default snapping mode. Snaps node positions and frame sizes to the
     /// nearest whole graph-space unit.
     pub const DEFAULT_SNAP: Option<Snap> = Some(Snap::Round);
@@ -385,6 +429,7 @@ impl Graph {
             max_inner_size: None,
             center_view: Self::DEFAULT_CENTER_VIEW,
             resize_behavior: Self::DEFAULT_RESIZE_BEHAVIOR,
+            auto_pan: Self::DEFAULT_AUTO_PAN,
             id,
             selected_nodes: None,
             immutable: false,
@@ -462,6 +507,22 @@ impl Graph {
     /// Default: [`Self::DEFAULT_RESIZE_BEHAVIOR`].
     pub fn resize_behavior(mut self, behavior: ResizeBehavior) -> Self {
         self.resize_behavior = behavior;
+        self
+    }
+
+    /// How the view pans while a drag holds the pointer near the edge of the
+    /// graph area, or `None` to disable it.
+    ///
+    /// This lets a node drag, an edge in progress or a rectangle selection
+    /// reach parts of the graph outside the view. In an
+    /// [`immutable`](Self::immutable) graph, only a rectangle selection pans
+    /// the view. The view pans only once a press becomes a drag, so a click
+    /// near the edge does not move it. Has no effect while
+    /// [`center_view`](Self::center_view) is set.
+    ///
+    /// Default: [`Self::DEFAULT_AUTO_PAN`] ([`AutoPan::DEFAULT`]).
+    pub fn auto_pan(mut self, auto_pan: Option<AutoPan>) -> Self {
+        self.auto_pan = auto_pan;
         self
     }
 
@@ -641,6 +702,22 @@ impl Graph {
             }
             // Record unconditionally so toggling `center_view`/behaviour works.
             gmem.last_viewport_size = Some(viewport_size);
+
+            // Pan the view while a drag holds the pointer near the edge of the
+            // graph area. As this happens before the scene shows, the
+            // graph-space pointer of this frame includes the pan, so dragged
+            // nodes, an edge in progress and a selection rect follow the
+            // pointer. Skip when `center_view` is set, as above.
+            if let Some(auto_pan) = self.auto_pan.filter(|_| !self.center_view) {
+                let action = gmem.pressed.as_ref().map(|p| &p.action);
+                let velocity = drag_pan_velocity(ui, auto_pan, graph_rect, action, self.immutable);
+                if velocity != egui::Vec2::ZERO {
+                    let delta = velocity * ui.input(|i| i.stable_dt);
+                    *scene_rect =
+                        pan_scene_rect(*scene_rect, viewport_size, self.zoom_range, delta);
+                    ui.ctx().request_repaint();
+                }
+            }
         }
 
         // Create the Scene.
@@ -658,306 +735,316 @@ impl Graph {
         let scroll = self
             .scroll_zoom
             .then(|| ui.input_mut(|input| std::mem::take(&mut input.smooth_scroll_delta)));
-        let mut scene_response = scene.show(ui, scene_rect, |ui| {
-            if let Some(scroll) = scroll {
-                ui.input_mut(|input| input.smooth_scroll_delta = scroll);
-            }
-            // Draw the selection rectangle if there is one.
-            let mut selection_rect = None;
-            let mut select = false;
-            let mut closest_socket = None;
-            let mut socket_press_released = None;
-            // Alignment guide lines collected during a drag, as (is_x_axis, line).
-            let mut guide_lines: Vec<(bool, AlignLine)> = Vec::new();
-
-            // Check for interactions with the scene area.
-            let scene_response = ui.response();
-            let ptr_on_graph = scene_response.hovered();
-
-            // Check for selection rectangle and node dragging.
-            let gmem_arc = memory(ui, self.id);
-            let mut gmem = gmem_arc.lock().expect("failed to lock graph temp memory");
-
-            // Apply externally-provided selection if set.
-            if let Some(nodes) = self.selected_nodes.take() {
-                gmem.selection.nodes = nodes;
-            }
-
-            // Reset the selection dirty flag for this frame.
-            gmem.selection.changed = false;
-            if !self.selection_enabled {
-                gmem.selection.changed = !gmem.selection.nodes.is_empty();
-                gmem.selection.nodes.clear();
-                if gmem
-                    .pressed
-                    .as_ref()
-                    .is_some_and(|pressed| !matches!(pressed.action, PressAction::Socket(_)))
-                {
-                    gmem.pressed = None;
+        let mut scene_response =
+            scene.show(ui, scene_rect, |ui| {
+                if let Some(scroll) = scroll {
+                    ui.input_mut(|input| input.smooth_scroll_delta = scroll);
                 }
-            }
+                // Draw the selection rectangle if there is one.
+                let mut selection_rect = None;
+                let mut select = false;
+                let mut closest_socket = None;
+                let mut socket_press_released = None;
+                let mut drag_released = None;
+                // Alignment guide lines collected during a drag, as (is_x_axis, line).
+                let mut guide_lines: Vec<(bool, AlignLine)> = Vec::new();
 
-            // Take the previous frame's "pointer over a node frame" flag (it is
-            // re-accumulated from each node's `contains_pointer()` as the nodes
-            // draw) so socket detection can treat node frames as part of the
-            // graph - see the `closest_socket` gate below.
-            let ptr_over_node_prev = std::mem::take(&mut gmem.ptr_over_node);
+                // Check for interactions with the scene area.
+                let scene_response = ui.response();
+                let ptr_on_graph = scene_response.hovered();
 
-            // FIXME: Here we grab the global pointer and transform its position
-            // to the graph scene space in order to check for initialising node
-            // drag events. However, doing this means we run the risk of
-            // incorrectly responding to events that should be captured by
-            // widgets floating above (like a window floating above the graph).
-            // We should change this to get the pointer only if it is hovered or
-            // interacting with the scene or any of its child nodes somehow.
-            let pointer = ui.input(|i| i.pointer.clone());
-            if let Some(ptr_global) = pointer.interact_pos().or(pointer.hover_pos()) {
-                let ptr_graph = ui
-                    .ctx()
-                    .layer_transform_from_global(ui.layer_id())
-                    .unwrap_or_default()
-                    .mul_pos(ptr_global);
+                // Check for selection rectangle and node dragging.
+                let gmem_arc = memory(ui, self.id);
+                let mut gmem = gmem_arc.lock().expect("failed to lock graph temp memory");
 
-                // Check for the closest socket. Use the raw graph-space pointer
-                // (the scene's `hover_pos()` is `None` over a node frame) gated on
-                // the pointer being over the scene background *or* a node frame, so
-                // sockets straddling a frame edge are detectable from either side.
-                let ptr_over_graph = ptr_on_graph || ptr_over_node_prev;
-                closest_socket = if ptr_over_graph {
-                    find_closest_socket(ptr_graph, layout, &gmem, ui)
-                        .map(|(socket, _dist_sqrd)| socket)
-                } else {
-                    None
-                };
+                // Apply externally-provided selection if set.
+                if let Some(nodes) = self.selected_nodes.take() {
+                    gmem.selection.nodes = nodes;
+                }
 
-                // When immutable, suppress socket presses (map to Select).
-                let closest_socket_for_interaction =
-                    if self.immutable { None } else { closest_socket };
-
-                // Check for graph interactions.
-                let mut interaction = graph_interaction(
-                    layout,
-                    &pointer,
-                    closest_socket_for_interaction,
-                    ptr_on_graph,
-                    ptr_graph,
-                    gmem.pressed.as_ref(),
-                );
+                // Reset the selection dirty flag for this frame.
+                gmem.selection.changed = false;
                 if !self.selection_enabled {
-                    interaction.select = false;
-                    interaction.selection_rect = None;
-                    interaction.drag_nodes_delta = egui::Vec2::ZERO;
-                    if interaction.pressed.as_ref().is_some_and(|pressed| {
-                        !matches!(pressed.action, PressAction::Socket(_))
-                    }) {
-                        interaction.pressed = None;
+                    gmem.selection.changed = !gmem.selection.nodes.is_empty();
+                    gmem.selection.nodes.clear();
+                    if gmem
+                        .pressed
+                        .as_ref()
+                        .is_some_and(|pressed| !matches!(pressed.action, PressAction::Socket(_)))
+                    {
+                        gmem.pressed = None;
                     }
                 }
 
-                // Move all selected nodes by a single delta (skip when
-                // immutable), keeping the group rigid (preserving its relative
-                // layout) by translating every node by the same offset rather
-                // than snapping each independently. Per axis, snap-align wins if
-                // a within-threshold edge/center is found; otherwise the axis
-                // falls back to snapping the pressed node's target to the grid.
-                // The per-node snap below skips the dragged nodes for the same
-                // (rigidity) reason.
-                if !self.immutable && interaction.drag_nodes_delta != egui::Vec2::ZERO {
-                    if let Some(pressed) = gmem.pressed.as_ref() {
-                        if let PressAction::DragNodes {
-                            node: Some(pressed_node),
-                        } = &pressed.action
-                        {
-                            let raw = interaction.drag_nodes_delta;
+                // Take the previous frame's "pointer over a node frame" flag (it is
+                // re-accumulated from each node's `contains_pointer()` as the nodes
+                // draw) so an edge in progress can connect to sockets from within a
+                // node frame - see the `closest_socket` gate below.
+                let ptr_over_node_prev = std::mem::take(&mut gmem.ptr_over_node);
 
-                            // The alignment threshold is configured in screen
-                            // pixels; convert it to graph units via the live
-                            // zoom so the snap zone stays a constant on-screen
-                            // size. Guard a missing/degenerate transform.
-                            let scale = ui
-                                .ctx()
-                                .layer_transform_to_global(ui.layer_id())
-                                .map(|t| t.scaling)
-                                .filter(|s| s.is_finite() && *s > 0.0)
-                                .unwrap_or(1.0);
-                            let modifiers = ui.input(|i| i.modifiers);
-                            let align_on =
-                                self.align && !modifiers.contains(self.align_disable_modifier);
-                            let threshold_px = self
-                                .align_threshold
-                                .filter(|t| t.is_finite() && *t > 0.0)
-                                .unwrap_or_else(|| ui.style().interaction.interact_radius);
-                            let threshold = threshold_px / scale;
+                // FIXME: Here we grab the global pointer and transform its position
+                // to the graph scene space in order to check for initialising node
+                // drag events. However, doing this means we run the risk of
+                // incorrectly responding to events that should be captured by
+                // widgets floating above (like a window floating above the graph).
+                // We should change this to get the pointer only if it is hovered or
+                // interacting with the scene or any of its child nodes somehow.
+                let pointer = ui.input(|i| i.pointer.clone());
+                if let Some(ptr_global) = pointer.interact_pos().or(pointer.hover_pos()) {
+                    let ptr_graph = ui
+                        .ctx()
+                        .layer_transform_from_global(ui.layer_id())
+                        .unwrap_or_default()
+                        .mul_pos(ptr_global);
 
-                            // Per-axis alignment of the dragged group's bounding
-                            // box to the surrounding (non-selected) nodes.
-                            let (line_x, line_y) = if align_on {
-                                let selected_rects: Vec<egui::Rect> = gmem
-                                    .selection
-                                    .nodes
-                                    .iter()
-                                    .filter_map(|id| {
-                                        let pos = *layout.get(id)?;
-                                        let size = *gmem.node_sizes.get(id)?;
-                                        Some(egui::Rect::from_min_size(pos, size))
-                                    })
-                                    .collect();
-                                // Sort references by id for deterministic
-                                // tie-breaks (HashMap order is unstable).
-                                let mut refs: Vec<(NodeId, egui::Rect)> = layout
-                                    .iter()
-                                    .filter(|(id, _)| !gmem.selection.nodes.contains(id))
-                                    .filter_map(|(id, &pos)| {
-                                        let size = *gmem.node_sizes.get(id)?;
-                                        Some((*id, egui::Rect::from_min_size(pos, size)))
-                                    })
-                                    .collect();
-                                refs.sort_by_key(|(id, _)| *id);
-                                let reference_rects: Vec<egui::Rect> =
-                                    refs.into_iter().map(|(_, r)| r).collect();
-                                align_adjust(
-                                    self.align_targets,
-                                    &selected_rects,
-                                    &reference_rects,
-                                    raw,
-                                    threshold,
-                                )
-                            } else {
-                                (None, None)
-                            };
+                    // Only detect a socket that the pointer can press or connect to.
+                    // Over the scene background, a press near a socket starts an
+                    // edge. Over a node frame, a press drags the node, so a socket
+                    // there is only detectable as the end of an edge in progress.
+                    // Use the raw graph-space pointer, as the scene's `hover_pos()`
+                    // is `None` over a node frame. An immutable graph detects no
+                    // sockets, so its presses map to `Select`.
+                    let edge_in_progress = matches!(
+                        gmem.pressed.as_ref().map(|p| &p.action),
+                        Some(PressAction::Socket(_))
+                    );
+                    let ptr_over_sockets = ptr_on_graph || (edge_in_progress && ptr_over_node_prev);
+                    closest_socket = if !self.immutable && ptr_over_sockets {
+                        find_closest_socket(ptr_graph, layout, &gmem, ui)
+                            .map(|(socket, _dist_sqrd)| socket)
+                    } else {
+                        None
+                    };
 
-                            // Combine per axis: alignment, else snap fallback of
-                            // the anchor's target (equivalent to the previous
-                            // `snap_pos(..) - current` math, applied per axis).
-                            let anchor = layout.get(&pressed_node.id).copied();
-                            let snap = self.snap;
-                            let snap_step = self.snap_step;
-                            let axis =
-                                |line: Option<AlignLine>, raw_a: f32, anchor_a: Option<f32>| {
-                                    match line {
-                                        Some(l) => raw_a + l.adjust,
-                                        None => match (snap, anchor_a) {
-                                            (Some(snap), Some(c)) => {
-                                                snap_f32(snap, snap_step, c + raw_a) - c
-                                            }
-                                            _ => raw_a,
-                                        },
-                                    }
+                    // Check for graph interactions.
+                    let mut interaction = graph_interaction(
+                        layout,
+                        &pointer,
+                        closest_socket,
+                        ptr_on_graph,
+                        ptr_graph,
+                        gmem.pressed.as_ref(),
+                    );
+                    if !self.selection_enabled {
+                        interaction.select = false;
+                        interaction.selection_rect = None;
+                        interaction.drag_nodes_delta = egui::Vec2::ZERO;
+                        if interaction.pressed.as_ref().is_some_and(|pressed| {
+                            !matches!(pressed.action, PressAction::Socket(_))
+                        }) {
+                            interaction.pressed = None;
+                        }
+                    }
+
+                    // Move all selected nodes by a single delta (skip when
+                    // immutable), keeping the group rigid (preserving its relative
+                    // layout) by translating every node by the same offset rather
+                    // than snapping each independently. Per axis, snap-align wins if
+                    // a within-threshold edge/center is found; otherwise the axis
+                    // falls back to snapping the pressed node's target to the grid.
+                    // The per-node snap below skips the dragged nodes for the same
+                    // (rigidity) reason.
+                    if !self.immutable && interaction.drag_nodes_delta != egui::Vec2::ZERO {
+                        if let Some(pressed) = gmem.pressed.as_ref() {
+                            if let PressAction::DragNodes {
+                                node: Some(pressed_node),
+                            } = &pressed.action
+                            {
+                                let raw = interaction.drag_nodes_delta;
+
+                                // The alignment threshold is configured in screen
+                                // pixels; convert it to graph units via the live
+                                // zoom so the snap zone stays a constant on-screen
+                                // size. Guard a missing/degenerate transform.
+                                let scale = ui
+                                    .ctx()
+                                    .layer_transform_to_global(ui.layer_id())
+                                    .map(|t| t.scaling)
+                                    .filter(|s| s.is_finite() && *s > 0.0)
+                                    .unwrap_or(1.0);
+                                let modifiers = ui.input(|i| i.modifiers);
+                                let align_on =
+                                    self.align && !modifiers.contains(self.align_disable_modifier);
+                                let threshold_px = self
+                                    .align_threshold
+                                    .filter(|t| t.is_finite() && *t > 0.0)
+                                    .unwrap_or_else(|| ui.style().interaction.interact_radius);
+                                let threshold = threshold_px / scale;
+
+                                // Per-axis alignment of the dragged group's bounding
+                                // box to the surrounding (non-selected) nodes.
+                                let (line_x, line_y) = if align_on {
+                                    let selected_rects: Vec<egui::Rect> = gmem
+                                        .selection
+                                        .nodes
+                                        .iter()
+                                        .filter_map(|id| {
+                                            let pos = *layout.get(id)?;
+                                            let size = *gmem.node_sizes.get(id)?;
+                                            Some(egui::Rect::from_min_size(pos, size))
+                                        })
+                                        .collect();
+                                    // Sort references by id for deterministic
+                                    // tie-breaks (HashMap order is unstable).
+                                    let mut refs: Vec<(NodeId, egui::Rect)> = layout
+                                        .iter()
+                                        .filter(|(id, _)| !gmem.selection.nodes.contains(id))
+                                        .filter_map(|(id, &pos)| {
+                                            let size = *gmem.node_sizes.get(id)?;
+                                            Some((*id, egui::Rect::from_min_size(pos, size)))
+                                        })
+                                        .collect();
+                                    refs.sort_by_key(|(id, _)| *id);
+                                    let reference_rects: Vec<egui::Rect> =
+                                        refs.into_iter().map(|(_, r)| r).collect();
+                                    align_adjust(
+                                        self.align_targets,
+                                        &selected_rects,
+                                        &reference_rects,
+                                        raw,
+                                        threshold,
+                                    )
+                                } else {
+                                    (None, None)
                                 };
-                            let delta = egui::vec2(
-                                axis(line_x, raw.x, anchor.map(|p| p.x)),
-                                axis(line_y, raw.y, anchor.map(|p| p.y)),
-                            );
 
-                            // Record the aligning edges so a subtle guide can be
-                            // drawn along them once the nodes are laid out.
-                            if self.align_guides {
-                                guide_lines.extend(line_x.map(|l| (true, l)));
-                                guide_lines.extend(line_y.map(|l| (false, l)));
-                            }
+                                // Combine per axis: alignment, else snap fallback of
+                                // the anchor's target (equivalent to the previous
+                                // `snap_pos(..) - current` math, applied per axis).
+                                let anchor = layout.get(&pressed_node.id).copied();
+                                let snap = self.snap;
+                                let snap_step = self.snap_step;
+                                let axis =
+                                    |line: Option<AlignLine>, raw_a: f32, anchor_a: Option<f32>| {
+                                        match line {
+                                            Some(l) => raw_a + l.adjust,
+                                            None => match (snap, anchor_a) {
+                                                (Some(snap), Some(c)) => {
+                                                    snap_f32(snap, snap_step, c + raw_a) - c
+                                                }
+                                                _ => raw_a,
+                                            },
+                                        }
+                                    };
+                                let delta = egui::vec2(
+                                    axis(line_x, raw.x, anchor.map(|p| p.x)),
+                                    axis(line_y, raw.y, anchor.map(|p| p.y)),
+                                );
 
-                            for &n_id in &gmem.selection.nodes {
-                                if let Some(pos) = layout.get_mut(&n_id) {
-                                    *pos += delta;
+                                // Record the aligning edges so a subtle guide can be
+                                // drawn along them once the nodes are laid out.
+                                if self.align_guides {
+                                    guide_lines.extend(line_x.map(|l| (true, l)));
+                                    guide_lines.extend(line_y.map(|l| (false, l)));
+                                }
+
+                                for &n_id in &gmem.selection.nodes {
+                                    if let Some(pos) = layout.get_mut(&n_id) {
+                                        *pos += delta;
+                                    }
                                 }
                             }
                         }
                     }
+
+                    gmem.pressed = interaction.pressed;
+                    gmem.closest_socket = closest_socket;
+                    selection_rect = interaction.selection_rect;
+                    select = interaction.select;
+                    socket_press_released = interaction.socket_press_released;
+                    drag_released = interaction.drag_released;
                 }
 
-                gmem.pressed = interaction.pressed;
-                gmem.closest_socket = closest_socket;
-                selection_rect = interaction.selection_rect;
-                select = interaction.select;
-                socket_press_released = interaction.socket_press_released;
-            }
-
-            // Snap node positions to whole graph-space units. Runs every frame
-            // (regardless of pointer presence) and after any drag delta has
-            // been applied, so it normalises dragged, auto-laid-out, and
-            // deserialized positions alike before the nodes render.
-            //
-            // Nodes in an active drag are skipped: they're translated rigidly
-            // above (anchored on the pressed node) to preserve the selection's
-            // relative layout, so snapping them per-node here would distort it.
-            if let Some(snap) = self.snap {
-                let dragging = matches!(
-                    gmem.pressed.as_ref().map(|p| &p.action),
-                    Some(PressAction::DragNodes { .. })
-                );
-                for (id, pos) in layout.iter_mut() {
-                    if dragging && gmem.selection.nodes.contains(id) {
-                        continue;
+                // Snap node positions to whole graph-space units. Runs every frame
+                // (regardless of pointer presence) and after any drag delta has
+                // been applied, so it normalises dragged, auto-laid-out, and
+                // deserialized positions alike before the nodes render.
+                //
+                // Nodes in an active drag are skipped: they're translated rigidly
+                // above (anchored on the pressed node) to preserve the selection's
+                // relative layout, so snapping them per-node here would distort it.
+                if let Some(snap) = self.snap {
+                    let dragging = matches!(
+                        gmem.pressed.as_ref().map(|p| &p.action),
+                        Some(PressAction::DragNodes { .. })
+                    );
+                    for (id, pos) in layout.iter_mut() {
+                        if dragging && gmem.selection.nodes.contains(id) {
+                            continue;
+                        }
+                        *pos = snap_pos(snap, self.snap_step, *pos);
                     }
-                    *pos = snap_pos(snap, self.snap_step, *pos);
                 }
-            }
 
-            // Paint the background rect.
-            let visible_rect = ui.clip_rect();
-            if self.background {
-                paint_background(visible_rect, ui);
-            }
+                // The whole selection moves with the pressed node, so the pressed
+                // node alone tells whether the drag moved the nodes. Compare after
+                // snapping, so a drag back to the start counts as no move.
+                let nodes_moved = drag_released
+                    .is_some_and(|n: PressedNode| layout.get(&n.id) != Some(&n.position_at_origin));
 
-            // Paint some subtle dots to check camera movement.
-            if self.dot_grid {
-                paint_dot_grid(visible_rect, self.dot_grid_step, ui);
-            }
+                // Paint the background rect.
+                let visible_rect = ui.clip_rect();
+                if self.background {
+                    paint_background(visible_rect, ui);
+                }
 
-            // Paint subtle guide lines along edges/centers aligning this frame.
-            if !guide_lines.is_empty() {
-                paint_align_guides(&guide_lines, self.align_guide_stroke, ui);
-            }
+                // Paint some subtle dots to check camera movement.
+                if self.dot_grid {
+                    paint_dot_grid(visible_rect, self.dot_grid_step, ui);
+                }
 
-            // Draw the selection area if there is one.
-            // TODO: Do this when `Show` is `drop`ped or finalised.
-            if let Some(sel_rect) = selection_rect {
-                paint_selection_area(sel_rect, ui);
-            }
+                // Paint subtle guide lines along edges/centers aligning this frame.
+                if !guide_lines.is_empty() {
+                    paint_align_guides(&guide_lines, self.align_guide_stroke, ui);
+                }
 
-            let mut visited = HashSet::default();
+                // Draw the selection area if there is one.
+                if let Some(sel_rect) = selection_rect {
+                    paint_selection_area(sel_rect, self.id, ui);
+                }
 
-            let show = Show {
-                selection_enabled: self.selection_enabled,
-                graph_id: self.id,
-                graph_rect,
-                selection_rect,
-                select,
-                closest_socket,
-                socket_press_released,
-                visited: &mut visited,
-                layout,
-                immutable: self.immutable,
-                snap: self.snap,
-                snap_step: self.snap_step,
-            };
+                let mut visited = HashSet::default();
 
-            // Drop the lock before running the content.
-            std::mem::drop(gmem);
+                let show = Show {
+                    selection_enabled: self.selection_enabled,
+                    graph_id: self.id,
+                    graph_rect,
+                    selection_rect,
+                    select,
+                    closest_socket,
+                    socket_press_released,
+                    visited: &mut visited,
+                    layout,
+                    immutable: self.immutable,
+                    snap: self.snap,
+                    snap_step: self.snap_step,
+                };
 
-            let output = content(ui, show);
+                // Drop the lock before running the content.
+                std::mem::drop(gmem);
 
-            prune_unused_nodes(self.id, &visited, ui);
-            bounding_rect = Some(ui.min_rect());
+                let output = content(ui, show);
 
-            // Snapshot selection only if it changed this frame.
-            let gmem_arc = memory(ui, self.id);
-            let gmem = gmem_arc.lock().expect("failed to lock graph temp memory");
-            let selection_changed = if gmem.selection.changed {
-                Some(gmem.selection.nodes.clone())
-            } else {
-                None
-            };
+                prune_unused_nodes(self.id, &visited, ui);
+                bounding_rect = Some(ui.min_rect());
 
-            (output, selection_changed)
-        });
-
-        let pointer_over_node = self.scroll_zoom
-            && {
+                // Snapshot selection only if it changed this frame.
                 let gmem_arc = memory(ui, self.id);
                 let gmem = gmem_arc.lock().expect("failed to lock graph temp memory");
-                gmem.ptr_over_node
-            };
+                let selection_changed = if gmem.selection.changed {
+                    Some(gmem.selection.nodes.clone())
+                } else {
+                    None
+                };
+
+                (output, selection_changed, nodes_moved)
+            });
+
+        let pointer_over_node = self.scroll_zoom && {
+            let gmem_arc = memory(ui, self.id);
+            let gmem = gmem_arc.lock().expect("failed to lock graph temp memory");
+            gmem.ptr_over_node
+        };
         if self.scroll_zoom && (scene_response.response.contains_pointer() || pointer_over_node) {
             let delta = ui.input_mut(|input| std::mem::take(&mut input.smooth_scroll_delta));
             if delta.y != 0.0 {
@@ -995,13 +1082,22 @@ impl Graph {
             }
         }
 
-        let (inner, selection_changed) = scene_response.inner;
+        let (inner, selection_changed, nodes_moved) = scene_response.inner;
         GraphResponse {
             inner,
             response: scene_response.response,
             selection_changed,
+            nodes_moved,
         }
     }
+}
+
+impl AutoPan {
+    /// A 32 pixel margin with a maximum speed of 1000 pixels per second.
+    pub const DEFAULT: Self = Self {
+        margin: 32.0,
+        max_speed: 1000.0,
+    };
 }
 
 impl GraphTempMemory {
@@ -1021,6 +1117,13 @@ impl GraphTempMemory {
 }
 
 impl NodeSockets {
+    /// Move all sockets by `delta`.
+    fn translate(&mut self, delta: egui::Vec2) {
+        for pos in self.inputs.values_mut().chain(self.outputs.values_mut()) {
+            *pos += delta;
+        }
+    }
+
     /// The screen position and normal of the input at the given index.
     ///
     /// Returns `None` if there is no input at the given index.
@@ -1124,12 +1227,19 @@ impl<'a> Show<'a> {
                 immutable,
                 ..
             } = self;
+            let memory = memory(ui, graph_id);
+            let edge_in_progress = {
+                let gmem = memory.lock().expect("failed to lock graph temp memory");
+                edge_in_progress(&gmem).is_some()
+            };
             let mut ctx = EdgesCtx {
                 selection_enabled: self.selection_enabled,
                 graph_id,
                 graph_rect,
                 selection_rect,
                 closest_socket,
+                edge_in_progress,
+                memory,
                 immutable,
             };
             content(&mut ctx, ui);
@@ -1144,6 +1254,8 @@ fn prune_unused_nodes(graph_id: egui::Id, visited: &HashSet<NodeId>, ui: &mut eg
     let gmem_arc = memory(ui, graph_id);
     let mut gmem = gmem_arc.lock().expect("failed to lock graph temp memory");
     gmem.node_sizes.retain(|k, _| visited.contains(k));
+    gmem.sockets.retain(|k, _| visited.contains(k));
+    gmem.node_positions.retain(|k, _| visited.contains(k));
     gmem.selection.nodes.retain(|k| visited.contains(k));
     if let Some(socket) = gmem.closest_socket.as_ref() {
         if !visited.contains(&socket.node) {
@@ -1202,38 +1314,25 @@ impl EdgesCtx {
     pub fn in_progress(&self, ui: &egui::Ui) -> Option<EdgeInProgress> {
         let gmem_arc = memory(ui, self.graph_id);
         let gmem = gmem_arc.lock().expect("failed to lock graph temp memory");
-        let pressed = gmem.pressed.as_ref()?;
-        let start = match pressed.action {
-            PressAction::Socket(socket) => {
-                let sockets = gmem.sockets.get(&socket.node)?;
-                let (pos, normal) = match socket.kind {
-                    socket::SocketKind::Input => sockets.input(socket.index)?,
-                    socket::SocketKind::Output => sockets.output(socket.index)?,
-                };
-                socket::PositionedSocket {
-                    socket,
-                    pos,
-                    normal,
-                }
-            }
-            _ => return None,
-        };
-        let (end_pos, end_socket) = match gmem.closest_socket {
-            Some(socket) if socket.kind != start.socket.kind => {
-                let sockets = gmem.sockets.get(&socket.node)?;
-                let (pos, normal) = match socket.kind {
-                    socket::SocketKind::Input => sockets.input(socket.index)?,
-                    socket::SocketKind::Output => sockets.output(socket.index)?,
-                };
-                (pos, Some((socket.kind, normal)))
-            }
-            _ => (pressed.current_pos, None),
-        };
-        Some(EdgeInProgress {
-            start,
-            end_pos,
-            end_socket,
-        })
+        edge_in_progress(&gmem)
+    }
+
+    /// The position and normal of output `a` and input `b`, for an edge from
+    /// `a` to `b`.
+    ///
+    /// Returns `None` if either socket does not exist.
+    fn edge_sockets(
+        &self,
+        (a, output): (NodeId, usize),
+        (b, input): (NodeId, usize),
+    ) -> Option<((egui::Pos2, egui::Vec2), (egui::Pos2, egui::Vec2))> {
+        let gmem = self
+            .memory
+            .lock()
+            .expect("failed to lock graph temp memory");
+        let a_out = gmem.sockets.get(&a)?.output(output)?;
+        let b_in = gmem.sockets.get(&b)?.input(input)?;
+        Some((a_out, b_in))
     }
 
     /// The full rect occuppied by the graph widget.
@@ -1302,6 +1401,48 @@ impl Default for View {
             layout: Default::default(),
         }
     }
+}
+
+impl Default for AutoPan {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// The edge that the user is in the progress of creating, if any.
+fn edge_in_progress(gmem: &GraphTempMemory) -> Option<EdgeInProgress> {
+    let pressed = gmem.pressed.as_ref()?;
+    let start = match pressed.action {
+        PressAction::Socket(socket) => {
+            let sockets = gmem.sockets.get(&socket.node)?;
+            let (pos, normal) = match socket.kind {
+                socket::SocketKind::Input => sockets.input(socket.index)?,
+                socket::SocketKind::Output => sockets.output(socket.index)?,
+            };
+            socket::PositionedSocket {
+                socket,
+                pos,
+                normal,
+            }
+        }
+        _ => return None,
+    };
+    let (end_pos, end_socket) = match gmem.closest_socket {
+        Some(socket) if socket.kind != start.socket.kind => {
+            let sockets = gmem.sockets.get(&socket.node)?;
+            let (pos, normal) = match socket.kind {
+                socket::SocketKind::Input => sockets.input(socket.index)?,
+                socket::SocketKind::Output => sockets.output(socket.index)?,
+            };
+            (pos, Some((socket.kind, normal)))
+        }
+        _ => (pressed.current_pos, None),
+    };
+    Some(EdgeInProgress {
+        start,
+        end_pos,
+        end_socket,
+    })
 }
 
 /// Find the socket that is closest to the given point.
@@ -1390,6 +1531,7 @@ fn graph_interaction(
     let mut socket_press_released = None;
     let mut drag_nodes_delta = egui::Vec2::ZERO;
     let mut selection_rect = None;
+    let mut drag_released = None;
 
     // Check for selecting/dragging.
     let pressed: Option<Pressed> = if let Some(pressed) = pressed {
@@ -1417,7 +1559,7 @@ fn graph_interaction(
             match pressed.action {
                 PressAction::Select => select = true,
                 PressAction::Socket(socket) => socket_press_released = Some(socket),
-                _ => (),
+                PressAction::DragNodes { ref node } => drag_released = node.clone(),
             }
             None
         } else {
@@ -1461,6 +1603,7 @@ fn graph_interaction(
         select,
         selection_rect,
         drag_nodes_delta,
+        drag_released,
     }
 }
 
@@ -1513,14 +1656,32 @@ fn paint_background(visible_rect: egui::Rect, ui: &mut egui::Ui) {
         .rect(visible_rect, 0.0, fill, stroke, egui::StrokeKind::Inside);
 }
 
-/// Paint the selection area rectangle.
-fn paint_selection_area(sel_rect: egui::Rect, ui: &mut egui::Ui) {
+/// Paint the selection area rectangle above the nodes.
+///
+/// The rectangle paints on a sublayer of the ui's layer, as do the node
+/// frames and sockets. `move_to_top` sorts it after those sibling sublayers,
+/// and egui keeps all sublayers directly above their parent, so areas such
+/// as windows above the graph stay above the rectangle.
+fn paint_selection_area(sel_rect: egui::Rect, graph_id: egui::Id, ui: &egui::Ui) {
+    let parent = ui.layer_id();
+    let layer = egui::LayerId::new(parent.order, graph_id.with("selection"));
+    let ctx = ui.ctx();
+    ctx.set_sublayer(parent, layer);
+    ctx.move_to_top(layer);
+    if let Some(transform) = ctx.layer_transform_to_global(parent) {
+        ctx.set_transform_layer(layer, transform);
+    }
     let color = ui.visuals().weak_text_color();
     let fill = color.linear_multiply(0.125);
     let width = 1.0;
     let stroke = egui::Stroke { width, color };
-    ui.painter()
-        .rect(sel_rect, 0.0, fill, stroke, egui::StrokeKind::Inside);
+    ui.painter().clone().with_layer_id(layer).rect(
+        sel_rect,
+        0.0,
+        fill,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
 }
 
 /// Combines the given id src with the `TypeId` of the `Graph` to produce a unique `egui::Id`.
@@ -1528,7 +1689,7 @@ pub fn id(id_src: impl Hash) -> egui::Id {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::any::TypeId::of::<Graph>().hash(&mut hasher);
     id_src.hash(&mut hasher);
-    egui::Id::new(hasher.finish())
+    egui::Id::unique(hasher.finish())
 }
 
 /// Access the graph's temporary memory for the given graph ID.
@@ -1569,20 +1730,120 @@ fn maintain_zoom_scene_rect(
     cur: egui::Vec2,
     zoom_range: egui::Rangef,
 ) -> egui::Rect {
-    let size = scene_rect.size();
-    if prev == cur || !scene_rect.is_finite() || size.x <= 0.0 || size.y <= 0.0 {
+    if prev == cur {
         return scene_rect;
     }
-    // The scale egui used last frame is set by the binding (letterbox) axis,
-    // i.e. the smaller ratio, clamped to the same range egui will enforce.
-    let scale = zoom_range.clamp((prev / size).min_elem());
-    if !scale.is_finite() || scale <= 0.0 {
+    let Some(scale) = scene_scale(scene_rect, prev, zoom_range) else {
         return scene_rect;
-    }
+    };
     // Using the same scalar on both axes makes `scene_rect` adopt the viewport
     // aspect ratio - the steady-state shape egui itself produces - while
     // keeping the center fixed. Next frame egui's fit yields `scale` again.
     egui::Rect::from_center_size(scene_rect.center(), cur / scale)
+}
+
+/// The scale (pixels-per-world-unit) with which egui's [`Scene`] fits
+/// `scene_rect` into a viewport of `viewport_size`.
+///
+/// Returns `None` when the inputs are degenerate.
+///
+/// [`Scene`]: egui::containers::Scene
+fn scene_scale(
+    scene_rect: egui::Rect,
+    viewport_size: egui::Vec2,
+    zoom_range: egui::Rangef,
+) -> Option<f32> {
+    let size = scene_rect.size();
+    if !scene_rect.is_finite() || size.x <= 0.0 || size.y <= 0.0 {
+        return None;
+    }
+    // The binding (letterbox) axis, i.e. the smaller ratio, sets the scale,
+    // clamped to the same range egui enforces.
+    let scale = zoom_range.clamp((viewport_size / size).min_elem());
+    (scale.is_finite() && scale > 0.0).then_some(scale)
+}
+
+/// Translate `scene_rect` so that egui's [`Scene`] pans the view by `delta`
+/// screen pixels within a viewport of `viewport_size`.
+///
+/// Returns `scene_rect` unchanged when the inputs are degenerate.
+///
+/// [`Scene`]: egui::containers::Scene
+fn pan_scene_rect(
+    scene_rect: egui::Rect,
+    viewport_size: egui::Vec2,
+    zoom_range: egui::Rangef,
+    delta: egui::Vec2,
+) -> egui::Rect {
+    match scene_scale(scene_rect, viewport_size, zoom_range) {
+        Some(scale) if delta.is_finite() => scene_rect.translate(delta / scale),
+        _ => scene_rect,
+    }
+}
+
+/// The auto-pan velocity for the current input, in screen pixels per second.
+///
+/// This is zero unless the primary button holds a drag whose press `action`
+/// pans the view. `viewport` is the graph area in the coordinates of `ui`.
+fn drag_pan_velocity(
+    ui: &egui::Ui,
+    auto_pan: AutoPan,
+    viewport: egui::Rect,
+    action: Option<&PressAction>,
+    immutable: bool,
+) -> egui::Vec2 {
+    if !action.is_some_and(|action| drag_pans(action, immutable)) {
+        return egui::Vec2::ZERO;
+    }
+    // A press that is still a possible click does not pan, so that a click
+    // on a node near the edge does not move the view.
+    let ptr_global = ui.input(|i| {
+        let pointer = &i.pointer;
+        let dragging = pointer.primary_down() && pointer.is_decidedly_dragging();
+        pointer.interact_pos().filter(|_| dragging)
+    });
+    let Some(ptr_global) = ptr_global else {
+        return egui::Vec2::ZERO;
+    };
+    let ptr = ui
+        .ctx()
+        .layer_transform_from_global(ui.layer_id())
+        .map_or(ptr_global, |t| t.mul_pos(ptr_global));
+    auto_pan_velocity(auto_pan, viewport, ptr)
+}
+
+/// Whether a drag with the given press action pans the view near the edge of
+/// the graph area.
+///
+/// An immutable graph has no node drags or edges, so only a rectangle
+/// selection pans it.
+fn drag_pans(action: &PressAction, immutable: bool) -> bool {
+    match action {
+        PressAction::Select => true,
+        PressAction::DragNodes { .. } | PressAction::Socket(_) => !immutable,
+    }
+}
+
+/// The auto-pan velocity, in screen pixels per second, for a pointer at `ptr`
+/// over the graph area `viewport`. See [`AutoPan`].
+///
+/// Returns zero for a margin or speed that is not positive and finite.
+fn auto_pan_velocity(auto_pan: AutoPan, viewport: egui::Rect, ptr: egui::Pos2) -> egui::Vec2 {
+    let AutoPan { margin, max_speed } = auto_pan;
+    let valid = |v: f32| v.is_finite() && v > 0.0;
+    if !valid(margin) || !valid(max_speed) || !ptr.is_finite() {
+        return egui::Vec2::ZERO;
+    }
+    // The depth of `p` into the band along each edge, as a fraction of the
+    // margin, signed toward the nearer edge.
+    let axis = |min: f32, max: f32, p: f32| {
+        let into_max = (p - (max - margin)) / margin;
+        let into_min = (min + margin - p) / margin;
+        into_max.clamp(0.0, 1.0) - into_min.clamp(0.0, 1.0)
+    };
+    let x = axis(viewport.min.x, viewport.max.x, ptr.x);
+    let y = axis(viewport.min.y, viewport.max.y, ptr.y);
+    egui::vec2(x, y) * max_speed
 }
 
 /// Snap a scalar to a multiple of `step` according to `snap`.
@@ -2225,5 +2486,368 @@ mod tests {
             None,
         );
         assert_eq!(layout, before);
+    }
+
+    mod selection_area {
+        use crate::node::{Node, NodeId};
+        use crate::{Graph, View};
+        use egui::epaint::ClippedShape;
+
+        const SCREEN: egui::Rect =
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(800.0, 600.0));
+        /// A point on the scene background, above and left of the nodes.
+        const START: egui::Pos2 = egui::pos2(50.0, 50.0);
+        /// A point below and right of the nodes.
+        const END: egui::Pos2 = egui::pos2(500.0, 300.0);
+
+        /// Drag a selection area over two nodes, and return the shapes of the
+        /// last pass with the style that painted them. With `window`, a window
+        /// floats above the graph.
+        fn drag_selection(window: bool) -> (Vec<ClippedShape>, std::sync::Arc<egui::Style>) {
+            let ctx = egui::Context::default();
+            let mut view = View {
+                scene_rect: SCREEN,
+                layout: [
+                    (NodeId(0), egui::pos2(100.0, 100.0)),
+                    (NodeId(1), egui::pos2(300.0, 100.0)),
+                ]
+                .into(),
+            };
+            let mut pass = |events: Vec<egui::Event>| {
+                let input = egui::RawInput {
+                    screen_rect: Some(SCREEN),
+                    events,
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(input, |ui| {
+                    Graph::new("graph").show(&mut view, ui, |ui, show| {
+                        show.nodes(ui, |nctx, ui| {
+                            for id in [NodeId(0), NodeId(1)] {
+                                let node = Node::from_id(id).inputs(1).outputs(1);
+                                node.show(nctx, ui, |c| c.framed(|ui, _| ui.label("x")));
+                            }
+                        });
+                    });
+                    if window {
+                        egui::Window::new("window")
+                            .fixed_pos(egui::pos2(200.0, 150.0))
+                            .show(ui.ctx(), |ui| ui.label("window"));
+                    }
+                });
+                output.textures_delta.clear();
+                output.shapes
+            };
+            pass(vec![egui::Event::PointerMoved(START)]);
+            pass(vec![]);
+            pass(vec![egui::Event::PointerButton {
+                pos: START,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            let shapes = pass(vec![egui::Event::PointerMoved(END)]);
+            (shapes, ctx.global_style())
+        }
+
+        /// The index of the selection area among the shapes.
+        fn selection_ix(shapes: &[ClippedShape], style: &egui::Style) -> Option<usize> {
+            let fill = style.visuals.weak_text_color().linear_multiply(0.125);
+            shapes
+                .iter()
+                .position(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == fill))
+        }
+
+        /// The selection area paints after the node frames, content and
+        /// sockets.
+        #[test]
+        fn paints_above_nodes() {
+            let (shapes, style) = drag_selection(false);
+            assert_eq!(selection_ix(&shapes, &style), Some(shapes.len() - 1));
+        }
+
+        /// A window above the graph paints after the selection area.
+        #[test]
+        fn paints_below_windows() {
+            let (shapes, style) = drag_selection(true);
+            let ix = selection_ix(&shapes, &style).expect("the selection area is painted");
+            let window_text = |s: &ClippedShape| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == "window");
+            assert!(shapes[ix + 1..].iter().any(window_text));
+        }
+    }
+
+    mod auto_pan {
+        use crate::node::{Node, NodeId};
+        use crate::socket::{Socket, SocketKind};
+        use crate::{
+            auto_pan_velocity, drag_pans, pan_scene_rect, AutoPan, Graph, PressAction, View,
+        };
+        use egui::{pos2, vec2, Pos2, Rangef, Rect, Vec2};
+
+        /// The graph area of the input-driven tests.
+        const SCREEN: Rect = Rect::from_min_max(Pos2::ZERO, pos2(800.0, 600.0));
+        const GRAPH: &str = "graph";
+        const A: NodeId = NodeId(0);
+        /// The time between passes, in seconds.
+        const DT: f32 = 1.0 / 60.0;
+
+        /// A graph of the node `A`, driven one pass at a time.
+        pub(super) struct TestGraph {
+            ctx: egui::Context,
+            view: View,
+            time: f64,
+        }
+
+        /// The graph state observed at the end of a pass.
+        pub(super) struct Pass {
+            scene_rect: Rect,
+            /// The graph-space position of `A`.
+            pub(super) a_pos: Pos2,
+            /// A screen-space point on the frame of `A`, clear of its content,
+            /// as the label within the frame senses presses for text
+            /// selection.
+            pub(super) a_grip: Pos2,
+            /// The graph-space pointer position.
+            ptr: Option<Pos2>,
+            /// See [`GraphResponse::nodes_moved`](crate::GraphResponse::nodes_moved).
+            pub(super) nodes_moved: bool,
+        }
+
+        /// Lay out a new graph with `A` at `a_pos`, over two passes, since
+        /// sizes settle after the first.
+        pub(super) fn test_graph(a_pos: Pos2) -> (TestGraph, Pass) {
+            let view = View {
+                scene_rect: SCREEN,
+                layout: [(A, a_pos)].into(),
+            };
+            let mut g = TestGraph {
+                ctx: egui::Context::default(),
+                view,
+                time: 0.0,
+            };
+            pass(&mut g, vec![]);
+            let p = pass(&mut g, vec![]);
+            (g, p)
+        }
+
+        /// Run one pass of the graph with the given input events.
+        pub(super) fn pass(g: &mut TestGraph, events: Vec<egui::Event>) -> Pass {
+            g.time += f64::from(DT);
+            let input = egui::RawInput {
+                screen_rect: Some(SCREEN),
+                time: Some(g.time),
+                predicted_dt: DT,
+                events,
+                ..Default::default()
+            };
+            let mut seen = None;
+            let mut nodes_moved = false;
+            let _ = g
+                .ctx
+                .run_ui(input, |ui| {
+                    let graph = Graph::new(GRAPH).snap(None);
+                    let resp = graph.show(&mut g.view, ui, |ui, show| {
+                        let mut a = None;
+                        show.nodes(ui, |nctx, ui| {
+                            let node = Node::from_id(A);
+                            a = Some(node.show(nctx, ui, |c| c.framed(|ui, _| ui.label("x"))));
+                        });
+                        let a = a.expect("the node ran");
+                        let ctx = ui.ctx();
+                        let to_screen = ctx.layer_transform_to_global(ui.layer_id());
+                        let to_screen = to_screen.unwrap_or_default();
+                        let ptr = ui.input(|i| i.pointer.latest_pos());
+                        let ptr = ptr.map(|p| to_screen.inverse().mul_pos(p));
+                        let grip = a.rect.min + Vec2::splat(2.0);
+                        seen = Some((to_screen.mul_pos(grip), ptr));
+                    });
+                    nodes_moved = resp.nodes_moved;
+                })
+                .textures_delta
+                .clear();
+            let (a_grip, ptr) = seen.expect("the graph ran");
+            Pass {
+                scene_rect: g.view.scene_rect,
+                a_pos: g.view.layout[&A],
+                a_grip,
+                ptr,
+                nodes_moved,
+            }
+        }
+
+        /// A press or release of the primary button at `pos`.
+        pub(super) fn primary(pos: Pos2, pressed: bool) -> egui::Event {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }
+        }
+
+        /// The default auto-pan velocity for a pointer at `ptr` over `SCREEN`.
+        fn velocity(ptr: Pos2) -> Vec2 {
+            auto_pan_velocity(AutoPan::DEFAULT, SCREEN, ptr)
+        }
+
+        #[test]
+        fn velocity_is_zero_away_from_the_edges() {
+            assert_eq!(velocity(SCREEN.center()), Vec2::ZERO);
+            assert_eq!(velocity(pos2(33.0, 33.0)), Vec2::ZERO);
+            assert_eq!(velocity(pos2(767.0, 567.0)), Vec2::ZERO);
+        }
+
+        #[test]
+        fn velocity_grows_toward_each_edge() {
+            let AutoPan { margin, max_speed } = AutoPan::DEFAULT;
+            let half = max_speed * 0.5;
+            let mid = SCREEN.center();
+            let x_near_max = SCREEN.max.x - margin * 0.5;
+            assert_eq!(velocity(pos2(x_near_max, mid.y)), vec2(half, 0.0));
+            assert_eq!(velocity(pos2(margin * 0.5, mid.y)), vec2(-half, 0.0));
+            assert_eq!(velocity(pos2(mid.x, margin * 0.5)), vec2(0.0, -half));
+            let y_near_max = SCREEN.max.y - margin * 0.5;
+            assert_eq!(velocity(pos2(mid.x, y_near_max)), vec2(0.0, half));
+            // At an edge and past it, the speed is the maximum.
+            assert_eq!(velocity(pos2(SCREEN.max.x, mid.y)), vec2(max_speed, 0.0));
+            assert_eq!(velocity(pos2(-100.0, mid.y)), vec2(-max_speed, 0.0));
+            // In a corner, both axes pan.
+            assert_eq!(velocity(SCREEN.max), vec2(max_speed, max_speed));
+        }
+
+        #[test]
+        fn velocity_is_zero_for_a_bad_config() {
+            let ptr = SCREEN.max;
+            for (margin, max_speed) in [(0.0, 1000.0), (32.0, 0.0), (f32::NAN, 1000.0)] {
+                let auto_pan = AutoPan { margin, max_speed };
+                assert_eq!(auto_pan_velocity(auto_pan, SCREEN, ptr), Vec2::ZERO);
+            }
+        }
+
+        #[test]
+        fn pan_scene_rect_pans_by_screen_pixels() {
+            let unbounded = Rangef::new(0.0, f32::INFINITY);
+            let scene = Rect::from_min_size(Pos2::ZERO, vec2(100.0, 100.0));
+            // A scale of 2 halves the graph-space distance.
+            let out = pan_scene_rect(scene, vec2(200.0, 200.0), unbounded, vec2(10.0, -4.0));
+            assert_eq!(out, scene.translate(vec2(5.0, -2.0)));
+            // The zoom range clamps the scale, as egui's `Scene` does.
+            let range = Rangef::new(0.25, 1.0);
+            let out = pan_scene_rect(scene, vec2(10.0, 10.0), range, vec2(10.0, 0.0));
+            assert_eq!(out, scene.translate(vec2(40.0, 0.0)));
+        }
+
+        #[test]
+        fn pan_scene_rect_skips_degenerate_inputs() {
+            let unbounded = Rangef::new(0.0, f32::INFINITY);
+            let size = vec2(200.0, 200.0);
+            let zero = Rect::from_min_size(Pos2::ZERO, vec2(0.0, 100.0));
+            assert_eq!(pan_scene_rect(zero, size, unbounded, vec2(1.0, 1.0)), zero);
+            let scene = Rect::from_min_size(Pos2::ZERO, vec2(100.0, 100.0));
+            let nan = vec2(f32::NAN, 0.0);
+            assert_eq!(pan_scene_rect(scene, size, unbounded, nan), scene);
+        }
+
+        #[test]
+        fn immutable_graph_pans_only_for_selection() {
+            let socket = Socket {
+                node: A,
+                kind: SocketKind::Output,
+                index: 0,
+            };
+            let drag = PressAction::DragNodes { node: None };
+            let edge = PressAction::Socket(socket);
+            assert!(drag_pans(&PressAction::Select, false));
+            assert!(drag_pans(&drag, false));
+            assert!(drag_pans(&edge, false));
+            assert!(drag_pans(&PressAction::Select, true));
+            assert!(!drag_pans(&drag, true));
+            assert!(!drag_pans(&edge, true));
+        }
+
+        /// A node dragged to the right edge pans the view right, and the node
+        /// stays under the pointer in graph space.
+        #[test]
+        fn node_drag_near_edge_pans_view() {
+            let (mut g, p) = test_graph(pos2(400.0, 300.0));
+            let start = p.a_grip;
+            pass(&mut g, vec![egui::Event::PointerMoved(start)]);
+            pass(&mut g, vec![primary(start, true)]);
+            // Hold the pointer 4 pixels inside the right edge.
+            let near_edge = pos2(SCREEN.max.x - 4.0, start.y);
+            let first = pass(&mut g, vec![egui::Event::PointerMoved(near_edge)]);
+            let ptr_offset = |p: &Pass| p.a_pos - p.ptr.expect("the pointer is over the graph");
+            let offset = ptr_offset(&first);
+            // A scene scale of 1, with the pointer 28 pixels into the margin.
+            let step = velocity(near_edge).x * DT;
+            assert!(step > 0.0);
+            let mut prev = first;
+            for _ in 0..5 {
+                let p = pass(&mut g, vec![]);
+                let pan = p.scene_rect.min - prev.scene_rect.min;
+                assert!((pan - vec2(step, 0.0)).length() < 1e-2, "pan {pan:?}");
+                assert!((ptr_offset(&p) - offset).length() < 1e-2);
+                prev = p;
+            }
+        }
+
+        /// A press on a node near the edge that does not move is a possible
+        /// click, so the view does not pan.
+        #[test]
+        fn press_without_drag_does_not_pan() {
+            let (mut g, p) = test_graph(pos2(780.0, 300.0));
+            let start = p.a_grip;
+            assert!(velocity(start).x > 0.0, "the node is within the margin");
+            pass(&mut g, vec![egui::Event::PointerMoved(start)]);
+            let pressed = pass(&mut g, vec![primary(start, true)]);
+            for _ in 0..5 {
+                let p = pass(&mut g, vec![]);
+                assert_eq!(p.scene_rect, pressed.scene_rect);
+            }
+        }
+    }
+
+    mod nodes_moved {
+        use super::auto_pan::{pass, primary, test_graph};
+        use egui::{pos2, vec2};
+
+        /// A nudge smaller than egui's drag threshold still moves the node,
+        /// so it counts as a move, on the release frame only.
+        #[test]
+        fn a_small_nudge_is_a_move() {
+            let (mut g, p) = test_graph(pos2(400.0, 300.0));
+            let start = p.a_grip;
+            let a_start = p.a_pos;
+            pass(&mut g, vec![egui::Event::PointerMoved(start)]);
+            assert!(!pass(&mut g, vec![primary(start, true)]).nodes_moved);
+            let nudged = start + vec2(3.0, 0.0);
+            let moving = pass(&mut g, vec![egui::Event::PointerMoved(nudged)]);
+            assert!(!moving.nodes_moved);
+            assert_eq!(moving.a_pos, a_start + vec2(3.0, 0.0));
+            assert!(pass(&mut g, vec![primary(nudged, false)]).nodes_moved);
+            assert!(!pass(&mut g, vec![]).nodes_moved);
+        }
+
+        #[test]
+        fn a_press_in_place_is_not_a_move() {
+            let (mut g, p) = test_graph(pos2(400.0, 300.0));
+            let start = p.a_grip;
+            pass(&mut g, vec![egui::Event::PointerMoved(start)]);
+            pass(&mut g, vec![primary(start, true)]);
+            assert!(!pass(&mut g, vec![primary(start, false)]).nodes_moved);
+        }
+
+        #[test]
+        fn a_drag_back_to_the_start_is_not_a_move() {
+            let (mut g, p) = test_graph(pos2(400.0, 300.0));
+            let start = p.a_grip;
+            pass(&mut g, vec![egui::Event::PointerMoved(start)]);
+            pass(&mut g, vec![primary(start, true)]);
+            let away = start + vec2(40.0, 20.0);
+            pass(&mut g, vec![egui::Event::PointerMoved(away)]);
+            pass(&mut g, vec![egui::Event::PointerMoved(start)]);
+            let released = pass(&mut g, vec![primary(start, false)]);
+            assert_eq!(released.a_pos, p.a_pos);
+            assert!(!released.nodes_moved);
+        }
     }
 }

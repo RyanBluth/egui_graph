@@ -35,6 +35,7 @@ pub struct Node {
     socket_color: Option<egui::Color32>,
     max_width: Option<f32>,
     animation_time: f32,
+    content_enabled: bool,
 }
 
 /// A unique identifier for a node within a graph.
@@ -66,6 +67,22 @@ pub struct FramedResponse<T> {
     pub sockets: crate::SocketLayout,
 }
 
+/// The outcome of the content closure of a node in [`Node::show_impl`].
+enum Content<R> {
+    /// The content ran.
+    Shown(FramedResponse<R>),
+    /// The node is out of view, so the content did not run.
+    Culled(R),
+}
+
+/// The response returned by [`Node::show_static`].
+pub struct StaticNodeResponse<T> {
+    /// The framed content's response.
+    pub inner: egui::InnerResponse<T>,
+    /// The hover response of each socket.
+    pub sockets: SocketResponses,
+}
+
 /// Events related to the creation of an edge to or from a node.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum EdgeEvent {
@@ -88,6 +105,8 @@ pub struct NodeCtx<'a> {
     min_size: egui::Vec2,
     graph_id: egui::Id,
     node_id: NodeId,
+    /// Whether the node explicitly enables its content widgets.
+    content_enabled: bool,
     immutable: bool,
     flow: egui::Direction,
     inputs: usize,
@@ -114,6 +133,7 @@ impl Node {
             flow: egui::Direction::LeftToRight,
             socket_radius: 3.0,
             animation_time: 0.1,
+            content_enabled: true,
         }
     }
 
@@ -181,6 +201,18 @@ impl Node {
         self
     }
 
+    /// Whether the widgets inside the node are enabled.
+    ///
+    /// A node with disabled content still drags, selects and connects edges,
+    /// unlike a node in an [`immutable`](crate::Graph::immutable) graph. Use
+    /// this for a single node whose content must not be edited.
+    ///
+    /// Default: `true`.
+    pub fn content_enabled(mut self, enabled: bool) -> Self {
+        self.content_enabled = enabled;
+        self
+    }
+
     /// Present the `Node`'s `Window` and add the given contents.
     ///
     /// The content closure receives a [`NodeCtx`] which provides access to interaction state
@@ -200,14 +232,145 @@ impl Node {
         ui: &mut egui::Ui,
         content: impl FnOnce(NodeCtx<'_>) -> FramedResponse<R>,
     ) -> NodeResponse<R> {
-        self.show_impl(ctx, ui, Box::new(content) as Box<_>)
+        self.show_impl(ctx, ui, Box::new(content) as Box<_>, None)
     }
 
+    /// As [`Node::show`], but `content` does not run while the node is out of
+    /// view.
+    ///
+    /// The node is out of view when its frame, at its size from the last
+    /// frame, lies outside the visible area of the graph, with a margin for
+    /// the frame shadow and the socket highlights. Then the node keeps its
+    /// last size and socket positions, so that edges, selection and the
+    /// automatic layout still use them. Selection, removal and edge events
+    /// occur as for a node in view. The response holds `None` in place of
+    /// the output of `content`, and has no socket responses.
+    ///
+    /// Use this in a large graph, where most nodes are out of view. Use
+    /// [`Node::show`] for content that must run every frame, such as a widget
+    /// that must keep keyboard focus while out of view.
+    pub fn show_or_cull<R>(
+        self,
+        ctx: &mut NodesCtx,
+        ui: &mut egui::Ui,
+        content: impl FnOnce(NodeCtx<'_>) -> FramedResponse<R>,
+    ) -> NodeResponse<Option<R>> {
+        let content = |node_ctx: NodeCtx<'_>| {
+            let FramedResponse { inner, sockets } = content(node_ctx);
+            let inner = egui::InnerResponse::new(Some(inner.inner), inner.response);
+            FramedResponse { inner, sockets }
+        };
+        self.show_impl(ctx, ui, Box::new(content) as Box<_>, Some(None))
+    }
+
+    /// Show the node as a static widget at the ui cursor, outside any graph.
+    ///
+    /// The frame and sockets paint exactly as within a
+    /// [`Graph`](crate::Graph), but there is no layout, selection, dragging
+    /// or edge interaction. `content` must call [`NodeCtx::framed`] or
+    /// [`NodeCtx::framed_with`], as within a graph. The socket responses
+    /// sense hover only, for tooltips.
+    pub fn show_static<R>(
+        self,
+        ui: &mut egui::Ui,
+        content: impl FnOnce(NodeCtx<'_>) -> FramedResponse<R>,
+    ) -> StaticNodeResponse<R> {
+        let (min_size, content_min_size, socket_padding) = self.min_sizes(ui);
+        let max_w = self.max_width.unwrap_or(ui.spacing().text_edit_width);
+        let put_size = egui::Vec2::new(max_w, min_size.y);
+        let put_rect = egui::Rect::from_min_size(ui.cursor().min, put_size);
+        let graph_id = ui.scope_id();
+        let egui_id = egui_id(graph_id, self.id);
+        let (socket_layer, frame_layer) = sublayers(ui, egui_id, true);
+
+        let builder = egui::UiBuilder::new()
+            .max_rect(put_rect)
+            .layer_id(frame_layer);
+        let inner_response = ui.scope_builder(builder, |ui| {
+            let node_ctx = NodeCtx {
+                ui,
+                interaction: NodeInteraction::default(),
+                min_size: content_min_size,
+                graph_id,
+                node_id: self.id,
+                content_enabled: self.content_enabled,
+                immutable: false,
+                flow: self.flow,
+                inputs: self.inputs,
+                outputs: self.outputs,
+            };
+            content(node_ctx)
+        });
+        let FramedResponse {
+            inner,
+            sockets: socket_layout,
+        } = inner_response.inner;
+
+        let rect = inner.response.rect;
+        let node_sockets = socket_layout.resolve(self.flow, rect, socket_padding);
+        let socket_color = self.socket_color.unwrap_or(ui.visuals().text_color());
+        let sockets = crate::socket::paint(
+            ui,
+            egui_id,
+            socket_layer,
+            &node_sockets,
+            socket_color,
+            self.socket_radius,
+            |_, _| false,
+        );
+        StaticNodeResponse { inner, sockets }
+    }
+
+    /// The minimum frame size that fits the sockets, the minimum content
+    /// size within the frame's corner radius, and the socket padding.
+    fn min_sizes(&self, ui: &egui::Ui) -> (egui::Vec2, egui::Vec2, f32) {
+        // The window should always be at least the interaction size.
+        let min_item_spacing = ui.spacing().item_spacing.x.min(ui.spacing().item_spacing.y);
+        let min_interact_len = ui
+            .spacing()
+            .interact_size
+            .x
+            .min(ui.spacing().interact_size.y);
+        let mut min_size = egui::Vec2::splat(min_interact_len);
+        // However, it should also always be at least large enough to comfortably show all
+        // inlets/outlets.
+        let max_sockets = std::cmp::max(self.inputs, self.outputs);
+        let min_socket_gap = min_interact_len + min_item_spacing;
+        let win_corner_radius = ui.visuals().window_corner_radius.ne as f32;
+        let socket_padding = crate::socket::socket_padding(ui.style());
+        if max_sockets > 1 {
+            let socket_gap_factor = if self.collapsed {
+                Self::COLLAPSED_SOCKET_GAP_FACTOR
+            } else {
+                1.0
+            };
+            let min_len = (max_sockets - 1) as f32 * min_socket_gap * socket_gap_factor
+                + socket_padding * 2.0;
+            match self.flow {
+                egui::Direction::LeftToRight | egui::Direction::RightToLeft => {
+                    min_size.y = min_size.y.max(min_len);
+                }
+                egui::Direction::TopDown | egui::Direction::BottomUp => {
+                    min_size.x = min_size.x.max(min_len);
+                }
+            }
+        }
+        // The content accounts for the frame corner radius.
+        let gap = egui::Vec2::splat(win_corner_radius * 2.0);
+        let content_min_size = min_size - gap;
+        (min_size, content_min_size, socket_padding)
+    }
+
+    /// Show the node with `content`.
+    ///
+    /// With `culled`, `content` does not run while the node is out of view,
+    /// and the response holds `culled` in place of the output of `content`.
     fn show_impl<'a, R>(
         self,
         ctx: &mut NodesCtx,
         ui: &mut egui::Ui,
         content: Box<dyn FnOnce(NodeCtx<'_>) -> FramedResponse<R> + 'a>,
+        culled: Option<R>,
     ) -> NodeResponse<R> {
         let snap = ctx.snap;
         let snap_step = ctx.snap_step;
@@ -253,37 +416,7 @@ impl Node {
             egui::Pos2::new(x, y)
         };
 
-        // The window should always be at least the interaction size.
-        let min_item_spacing = ui.spacing().item_spacing.x.min(ui.spacing().item_spacing.y);
-        let min_interact_len = ui
-            .spacing()
-            .interact_size
-            .x
-            .min(ui.spacing().interact_size.y);
-        let mut min_size = egui::Vec2::splat(min_interact_len);
-        // However, it should also always be at least large enough to comfortably show all
-        // inlets/outlets.
-        let max_sockets = std::cmp::max(self.inputs, self.outputs);
-        let min_socket_gap = min_interact_len + min_item_spacing;
-        let win_corner_radius = ui.visuals().window_corner_radius.ne as f32;
-        let socket_padding = crate::socket::socket_padding(ui.style());
-        if max_sockets > 1 {
-            let socket_gap_factor = if self.collapsed {
-                Self::COLLAPSED_SOCKET_GAP_FACTOR
-            } else {
-                1.0
-            };
-            let min_len = (max_sockets - 1) as f32 * min_socket_gap * socket_gap_factor
-                + socket_padding * 2.0;
-            match self.flow {
-                egui::Direction::LeftToRight | egui::Direction::RightToLeft => {
-                    min_size.y = min_size.y.max(min_len);
-                }
-                egui::Direction::TopDown | egui::Direction::BottomUp => {
-                    min_size.x = min_size.x.max(min_len);
-                }
-            }
-        }
+        let (min_size, content_min_size, socket_padding) = self.min_sizes(ui);
 
         let max_w = self.max_width.unwrap_or(ui.spacing().text_edit_width);
         let max_size = egui::Vec2::new(max_w, ctx.graph_rect.height());
@@ -295,16 +428,13 @@ impl Node {
         // If `shift` is down, rectangle selection is reserved for edges.
         // NOTE: We use the size from last frame as we don't know the size until
         // the user's content is added... Is there a better way to handle this?
-        let (mut selected, in_selection_rect) = {
+        let (mut selected, in_selection_rect, last_size) = {
             let gmem_arc = crate::memory(ui, ctx.graph_id);
             let mut gmem = gmem_arc.lock().expect("failed to lock graph temp memory");
+            let last_size = gmem.node_sizes.get(&self.id).copied();
             let in_selection_rect = match ctx.selection_rect {
                 Some(sel_rect) if ui.input(|i| !i.modifiers.shift) => {
-                    let size = gmem
-                        .node_sizes
-                        .get(&self.id)
-                        .cloned()
-                        .unwrap_or(egui::Vec2::ZERO);
+                    let size = last_size.unwrap_or(egui::Vec2::ZERO);
                     let rect = egui::Rect::from_min_size(pos_graph, size);
                     sel_rect.intersects(rect)
                 }
@@ -322,34 +452,24 @@ impl Node {
 
             let selected = gmem.selection.nodes.contains(&self.id);
 
-            (selected, in_selection_rect)
+            (selected, in_selection_rect, last_size)
         };
-
-        // Calculate the minimum size for the content (accounting for frame corner radius).
-        let gap = egui::Vec2::splat(win_corner_radius * 2.0);
-        let content_min_size = min_size - gap;
 
         // Custom framed node container that remains in the scene's layer
         let put_size = egui::Vec2::new(max_size.x, min_size.y);
         let put_rect = egui::Rect::from_min_size(pos_graph, put_size);
 
-        let scene_layer = ui.layer_id();
+        // A node out of view skips the work that only affects what is drawn.
+        let in_view = last_size.is_none_or(|size| {
+            let rect = egui::Rect::from_min_size(pos_graph, size);
+            let margin = view_margin(ui.style(), self.socket_radius);
+            ui.clip_rect().intersects(rect.expand(margin))
+        });
+        let culled = culled.zip(last_size).filter(|_| !in_view);
+
         let node_id = self.id;
         let egui_id = egui_id(ctx.graph_id, node_id);
-
-        // Socket layer below the frame so node content takes interaction precedence.
-        let socket_layer = egui::LayerId::new(scene_layer.order, egui_id.with("sockets"));
-        ui.ctx().set_sublayer(scene_layer, socket_layer);
-        if let Some(transform) = ui.ctx().layer_transform_to_global(scene_layer) {
-            ui.ctx().set_transform_layer(socket_layer, transform);
-        }
-
-        // Frame layer on top.
-        let frame_layer = egui::LayerId::new(scene_layer.order, egui_id);
-        ui.ctx().set_sublayer(scene_layer, frame_layer);
-        if let Some(transform) = ui.ctx().layer_transform_to_global(scene_layer) {
-            ui.ctx().set_transform_layer(frame_layer, transform);
-        }
+        let (socket_layer, frame_layer) = sublayers(ui, egui_id, in_view);
 
         // A `Ui` scope for the node's layer.
         let builder = egui::UiBuilder::new()
@@ -357,58 +477,84 @@ impl Node {
             .layer_id(frame_layer)
             .sense(egui::Sense::click_and_drag());
         let immutable = ctx.immutable;
-        let inner_response = ui.scope_builder(builder, |ui| {
-            let hovered = ui.response().hovered();
-            // Create the NodeCtx and call the user's content closure.
-            // The user is responsible for calling `framed` or `default_framed`
-            // on the context.
-            let node_ctx = NodeCtx {
-                ui,
-                interaction: NodeInteraction {
-                    selected,
-                    in_selection_rect,
-                    hovered,
-                },
-                min_size: content_min_size,
-                graph_id: ctx.graph_id,
-                node_id,
-                immutable,
-                flow: self.flow,
-                inputs: self.inputs,
-                outputs: self.outputs,
-            };
-            content(node_ctx)
+        let inner_response = ui.scope_builder(builder, |ui| match culled {
+            // Take the last size without the content, so that the node uses
+            // the same space and egui ids as in view.
+            Some((culled, size)) => {
+                ui.set_min_size(size);
+                Content::Culled(culled)
+            }
+            None => {
+                let hovered = ui.response().hovered();
+                // Create the NodeCtx and call the user's content closure.
+                // The user is responsible for calling `framed` or `default_framed`
+                // on the context.
+                let node_ctx = NodeCtx {
+                    ui,
+                    interaction: NodeInteraction {
+                        selected,
+                        in_selection_rect,
+                        hovered,
+                    },
+                    min_size: content_min_size,
+                    graph_id: ctx.graph_id,
+                    node_id,
+                    content_enabled: self.content_enabled,
+                    immutable,
+                    flow: self.flow,
+                    inputs: self.inputs,
+                    outputs: self.outputs,
+                };
+                Content::Shown(content(node_ctx))
+            }
         });
 
         // Take the union of the ui scope and the frame response to monitor for
-        // interactions.
-        let FramedResponse {
-            inner: content_inner_response,
-            sockets: socket_layout,
-        } = inner_response.inner;
-        let mut response = inner_response
-            .response
-            .union(content_inner_response.response);
-        let content_output = content_inner_response.inner;
+        // interactions, and resolve the socket layout to concrete positions.
+        let (mut response, content_output, node_sockets) = match inner_response.inner {
+            Content::Shown(FramedResponse { inner, sockets }) => {
+                let response = inner_response.response.union(inner.response);
+                let node_sockets = sockets.resolve(self.flow, response.rect, socket_padding);
+                (response, inner.inner, Some(node_sockets))
+            }
+            Content::Culled(culled) => (inner_response.response, culled, None),
+        };
 
         // Update the stored data for this node and check for edge events.
         let mut edge_event = None;
         {
             let gmem_arc = crate::memory(ui, ctx.graph_id);
             let mut gmem = gmem_arc.lock().expect("failed to lock graph temp memory");
-            // Snap the recorded size so auto-layout and selection see tidy
-            // values. Sizes always round (never floor) so they can't shrink
-            // below the rendered frame and break hit-testing or packing.
-            let size = match snap {
-                Some(_) => crate::snap_vec(crate::Snap::Round, snap_step, response.rect.size()),
-                None => response.rect.size(),
-            };
-            gmem.node_sizes.insert(self.id, size);
+            match &node_sockets {
+                Some(node_sockets) => {
+                    // Snap the recorded size so auto-layout and selection see tidy
+                    // values. Sizes always round (never floor) so they can't shrink
+                    // below the rendered frame and break hit-testing or packing.
+                    let size = match snap {
+                        Some(_) => {
+                            crate::snap_vec(crate::Snap::Round, snap_step, response.rect.size())
+                        }
+                        None => response.rect.size(),
+                    };
+                    gmem.node_sizes.insert(self.id, size);
+                    gmem.sockets.insert(self.id, node_sockets.clone());
+                }
+                // A culled node keeps its size, and its sockets move with it.
+                None => {
+                    let last_pos = gmem.node_positions.get(&self.id).copied();
+                    let delta = last_pos.map_or(egui::Vec2::ZERO, |p| response.rect.min - p);
+                    if let Some(sockets) = gmem.sockets.get_mut(&self.id) {
+                        sockets.translate(delta);
+                    }
+                }
+            }
+            gmem.node_positions.insert(self.id, response.rect.min);
 
             // Treat the pointer being over this node's frame as "over the graph"
-            // for next frame's socket detection (see `lib.rs`). `contains_pointer`
-            // stays true mid-drag (drag-and-drop target semantics) and is false
-            // when a window fully occludes the frame.
+            // for next frame's socket detection while an edge is in progress
+            // (see `lib.rs`). `contains_pointer` stays true mid-drag
+            // (drag-and-drop target semantics) and is false when a window fully
+            // occludes the frame.
             gmem.ptr_over_node |= response.contains_pointer();
 
             let ctrl_down = ui.input(|i| i.modifiers.ctrl);
@@ -496,22 +642,23 @@ impl Node {
             }
         }
 
-        // Resolve the socket layout to concrete positions.
-        let node_sockets = socket_layout.resolve(self.flow, response.rect, socket_padding);
-
-        // Paint and interact with all sockets.
-        let socket_color = self.socket_color.unwrap_or(ui.visuals().text_color());
-        let socket_responses = crate::socket::show(
-            ui,
-            ctx.graph_id,
-            self.id,
-            egui_id,
-            socket_layer,
-            response.rect,
-            &node_sockets,
-            socket_color,
-            self.socket_radius,
-        );
+        // Paint and interact with all sockets of a node in view.
+        let socket_responses = match node_sockets.filter(|_| in_view) {
+            Some(node_sockets) => {
+                let socket_color = self.socket_color.unwrap_or(ui.visuals().text_color());
+                crate::socket::show(
+                    ui,
+                    ctx.graph_id,
+                    self.id,
+                    egui_id,
+                    socket_layer,
+                    &node_sockets,
+                    socket_color,
+                    self.socket_radius,
+                )
+            }
+            None => SocketResponses::default(),
+        };
 
         // If the delete or backspace key was pressed and the node is selected, remove it.
         // Skip when immutable.
@@ -554,9 +701,17 @@ impl Node {
 
 impl NodeId {
     /// Create a new NodeId by hashing any hashable value.
+    ///
+    /// The id is the SipHash-1-3 hash of the value, with zero keys. This hash
+    /// does not change between Rust releases, so ids made from the same value
+    /// can be saved and used again by a later build, e.g. as the keys of a
+    /// serialized [`View`](crate::View) layout.
+    ///
+    /// The id also depends on the [`Hash`] impl of the value. For example, a
+    /// `usize` gives a different id on 32-bit and 64-bit targets.
     pub fn new(id_src: impl Hash) -> Self {
         use std::hash::Hasher;
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher = siphasher::sip::SipHasher13::new();
         id_src.hash(&mut hasher);
         NodeId(hasher.finish())
     }
@@ -733,6 +888,7 @@ impl<'a> NodeCtx<'a> {
         content: impl FnOnce(&mut egui::Ui, &mut crate::SocketLayout) -> T,
     ) -> FramedResponse<T> {
         let min_size = self.min_size;
+        let content_enabled = self.content_enabled;
         let immutable = self.immutable;
         let mut socket_layout =
             crate::SocketLayout::evenly_spaced(self.flow, self.inputs, self.outputs);
@@ -740,9 +896,9 @@ impl<'a> NodeCtx<'a> {
         let inner_response = frame.show(self.ui, |ui| {
             ui.scope_builder(builder, |ui| {
                 ui.set_min_size(min_size);
-                // Disable content widgets when immutable (inside the frame
-                // so that the frame itself retains normal styling).
-                if immutable && !content_enabled_when_immutable {
+                // Keep explicit content disabling, even when immutable graphs
+                // allow editing through framed_with_interactive.
+                if !content_enabled || (immutable && !content_enabled_when_immutable) {
                     ui.disable();
                 }
                 content(ui, &mut socket_layout)
@@ -755,6 +911,42 @@ impl<'a> NodeCtx<'a> {
             sockets: socket_layout,
         }
     }
+}
+
+/// Register the node's two sublayers of the ui's layer: the socket layer,
+/// which paints sockets above the ui's own content such as graph edges, and
+/// the frame layer above it.
+/// Both follow the ui layer's transform.
+///
+/// Only a node in view registers its sublayers, as the cost for egui to
+/// register a sublayer grows with the number of layers. The sublayers of a
+/// node out of view still follow the transform, so that its widgets do not
+/// respond at an old position.
+fn sublayers(ui: &egui::Ui, egui_id: egui::Id, in_view: bool) -> (egui::LayerId, egui::LayerId) {
+    let parent = ui.layer_id();
+    let socket_layer = egui::LayerId::new(parent.order, egui_id.with("sockets"));
+    let frame_layer = egui::LayerId::new(parent.order, egui_id);
+    for layer in [socket_layer, frame_layer] {
+        if in_view {
+            ui.ctx().set_sublayer(parent, layer);
+        }
+        if let Some(transform) = ui.ctx().layer_transform_to_global(parent) {
+            ui.ctx().set_transform_layer(layer, transform);
+        }
+    }
+    (socket_layer, frame_layer)
+}
+
+/// How far out of the visible area of a graph a node still counts as in
+/// view, as its frame shadow and socket highlights paint outside its frame.
+fn view_margin(style: &egui::Style, socket_radius: f32) -> f32 {
+    let shadow = style.visuals.window_shadow.margin();
+    let shadow = shadow
+        .left
+        .max(shadow.right)
+        .max(shadow.top)
+        .max(shadow.bottom);
+    shadow.max(crate::socket::highlight_radius(socket_radius))
 }
 
 /// The default frame styling used for the `Node`'s `Window`.
@@ -779,4 +971,332 @@ pub fn default_frame(style: &egui::Style, interaction: NodeInteraction) -> egui:
     }
 
     frame
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A static node paints outside any graph and yields a hover response
+    /// per socket. Inputs sit on the frame's top edge in index order and
+    /// outputs on its bottom edge.
+    #[test]
+    fn static_node_paints_sockets_on_the_frame() {
+        let ctx = egui::Context::default();
+        let mut out = None;
+        // Two passes, since fonts and sizes settle after the first.
+        for _ in 0..2 {
+            let _ = ctx
+                .run_ui(egui::RawInput::default(), |ui| {
+                    let res = Node::from_id(NodeId(0))
+                        .inputs(2)
+                        .outputs(1)
+                        .flow(egui::Direction::TopDown)
+                        .show_static(ui, |c| c.framed(|ui, _| ui.label("x")));
+                    let rect = res.inner.response.rect;
+                    let inputs: Vec<egui::Pos2> =
+                        res.sockets.inputs().map(|(_, r)| r.rect.center()).collect();
+                    let outputs: Vec<egui::Pos2> = res
+                        .sockets
+                        .outputs()
+                        .map(|(_, r)| r.rect.center())
+                        .collect();
+                    out = Some((rect, inputs, outputs));
+                })
+                .textures_delta
+                .clear();
+        }
+        let (rect, inputs, outputs) = out.expect("the panel ran");
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(outputs.len(), 1);
+        for pos in &inputs {
+            assert!((pos.y - rect.top()).abs() < 1e-3, "{pos:?} off {rect:?}");
+        }
+        assert!((outputs[0].y - rect.bottom()).abs() < 1e-3);
+        assert!(inputs[0].x < inputs[1].x);
+    }
+
+    /// Whether the content ui is enabled for a node in a graph, given the
+    /// graph's immutability and the node's content flag.
+    fn graph_content_enabled(immutable: bool, content_enabled: bool, interactive: bool) -> bool {
+        let ctx = egui::Context::default();
+        let mut view = crate::View::default();
+        let mut enabled = None;
+        let _ = ctx
+            .run_ui(egui::RawInput::default(), |ui| {
+                crate::Graph::from_id(egui::Id::unique("graph"))
+                    .immutable(immutable)
+                    .show(&mut view, ui, |ui, show| {
+                        show.nodes(ui, |nctx, ui| {
+                            Node::from_id(NodeId(0))
+                                .content_enabled(content_enabled)
+                                .show(nctx, ui, |c| {
+                                    if interactive {
+                                        c.framed_with_interactive(
+                                            egui::Frame::default(),
+                                            |ui, _| enabled = Some(ui.is_enabled()),
+                                        )
+                                    } else {
+                                        c.framed(|ui, _| enabled = Some(ui.is_enabled()))
+                                    }
+                                });
+                        });
+                    });
+            })
+            .textures_delta
+            .clear();
+        enabled.expect("the node content ran")
+    }
+
+    #[test]
+    fn content_enabled_disables_only_the_node_content() {
+        let cases = [
+            (false, true, true),
+            (false, false, false),
+            (true, true, false),
+            (true, false, false),
+        ];
+        for (immutable, content, expected) in cases {
+            let enabled = graph_content_enabled(immutable, content, false);
+            assert_eq!(
+                enabled, expected,
+                "immutable {immutable}, content {content}"
+            );
+        }
+
+        // Interactive frames override graph immutability, but must still
+        // respect an explicitly disabled node.
+        for immutable in [false, true] {
+            for content in [false, true] {
+                assert_eq!(graph_content_enabled(immutable, content, true), content);
+            }
+        }
+
+        // A static node follows the flag too.
+        let ctx = egui::Context::default();
+        let mut enabled = None;
+        let _ = ctx
+            .run_ui(egui::RawInput::default(), |ui| {
+                Node::from_id(NodeId(0))
+                    .content_enabled(false)
+                    .show_static(ui, |c| c.framed(|ui, _| enabled = Some(ui.is_enabled())));
+            })
+            .textures_delta
+            .clear();
+        assert_eq!(enabled, Some(false));
+    }
+
+    /// Ids made from a value stay the same, so saved layouts stay valid. These
+    /// are the ids that `std::hash::DefaultHasher` gave in Rust 1.94.
+    #[test]
+    fn node_id_new_is_stable() {
+        let cases = [
+            (NodeId::new("node_1"), 0x8448cd7200baabf5),
+            (NodeId::new(""), 0x30406ea523c53def),
+            (
+                NodeId::new("a longer id that spans several words"),
+                0x8d53347dbcaf72d1,
+            ),
+            (NodeId::new(0u64), 0xbd60acb658c79e45),
+            (NodeId::new(("graph", 7u32)), 0x6771a91e081e9a6b),
+        ];
+        for (id, expected) in cases {
+            assert_eq!(id.value(), expected);
+        }
+    }
+
+    mod cull {
+        use super::*;
+        use crate::View;
+        use std::collections::HashSet;
+
+        /// A graph of nodes `A` and `B`, driven one pass at a time.
+        struct TestGraph {
+            ctx: egui::Context,
+            view: View,
+            /// Whether `A` shows with [`Node::show_or_cull`], else with
+            /// [`Node::show`].
+            cull: bool,
+            selected: HashSet<NodeId>,
+        }
+
+        /// The state of the graph observed at the end of a pass.
+        struct Pass {
+            /// Whether the content of `A` ran.
+            a_ran: bool,
+            a_rect: egui::Rect,
+            /// The position and normal of the output of `A`, as edges see it.
+            a_out: Option<(egui::Pos2, egui::Vec2)>,
+            /// Whether `A` has a response for its output.
+            a_out_response: bool,
+            a_removed: bool,
+            /// The id of the content ui of `B`, which shows after `A`.
+            b_content_id: egui::Id,
+        }
+
+        const SCREEN: egui::Rect =
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(800.0, 600.0));
+        /// Has one output.
+        const A: NodeId = NodeId(0);
+        /// Has one input, to the right of `A`.
+        const B: NodeId = NodeId(1);
+
+        /// A view in which `A` is out of view and `B` is in view.
+        fn panned() -> egui::Rect {
+            SCREEN.translate(egui::vec2(300.0, 0.0))
+        }
+
+        /// Lay out a new graph in view over two passes, since sizes settle
+        /// after the first.
+        fn test_graph(cull: bool) -> (TestGraph, Pass) {
+            let mut g = TestGraph {
+                ctx: egui::Context::default(),
+                view: View {
+                    scene_rect: SCREEN,
+                    layout: [(A, egui::pos2(100.0, 100.0)), (B, egui::pos2(400.0, 100.0))].into(),
+                },
+                cull,
+                selected: HashSet::new(),
+            };
+            pass(&mut g, vec![]);
+            let p = pass(&mut g, vec![]);
+            (g, p)
+        }
+
+        /// Run one pass of the graph with the given input events.
+        fn pass(g: &mut TestGraph, events: Vec<egui::Event>) -> Pass {
+            let input = egui::RawInput {
+                screen_rect: Some(SCREEN),
+                events,
+                ..Default::default()
+            };
+            let cull = g.cull;
+            let selected = g.selected.clone();
+            let mut out = None;
+            let _ = g
+                .ctx
+                .run_ui(input, |ui| {
+                    let graph = crate::Graph::new("graph").selected_nodes(selected.clone());
+                    graph.show(&mut g.view, ui, |ui, show| {
+                        let mut nodes = None;
+                        let mut a_out = None;
+                        show.nodes(ui, |nctx, ui| {
+                            let mut a_ran = false;
+                            let a = Node::from_id(A).outputs(1).animation_time(0.0);
+                            let content = |c: NodeCtx| {
+                                a_ran = true;
+                                c.framed(|ui, _| ui.label("a"))
+                            };
+                            let (a_rect, a_out_response, a_removed) = if cull {
+                                let r = a.show_or_cull(nctx, ui, content);
+                                (r.rect, r.sockets().output(0).is_some(), r.removed())
+                            } else {
+                                let r = a.show(nctx, ui, content);
+                                (r.rect, r.sockets().output(0).is_some(), r.removed())
+                            };
+                            let mut b_content_id = None;
+                            Node::from_id(B).inputs(1).show(nctx, ui, |c| {
+                                c.framed(|ui, _| b_content_id = Some(ui.scope_id()))
+                            });
+                            nodes = Some(Pass {
+                                a_ran,
+                                a_rect,
+                                a_out: None,
+                                a_out_response,
+                                a_removed,
+                                b_content_id: b_content_id.expect("B ran"),
+                            });
+                        })
+                        .edges(ui, |ectx, ui| a_out = Some(ectx.output(ui, A, 0)));
+                        let a_out = a_out.expect("the edges ran");
+                        out = nodes.map(|p| Pass { a_out, ..p });
+                    });
+                })
+                .textures_delta
+                .clear();
+            out.expect("the graph ran")
+        }
+
+        /// Out of view, `A` skips its content and keeps its recorded size and
+        /// its sockets.
+        /// Back in view, its content runs again.
+        #[test]
+        fn out_of_view_node_skips_content() {
+            let (mut g, in_view) = test_graph(true);
+            assert!(in_view.a_ran);
+            assert!(in_view.a_out_response);
+            g.view.scene_rect = panned();
+            let p = pass(&mut g, vec![]);
+            assert!(!p.a_ran);
+            let size =
+                crate::with_graph_memory(&g.ctx, crate::id("graph"), |gmem| gmem.node_sizes()[&A]);
+            assert_eq!(
+                p.a_rect,
+                egui::Rect::from_min_size(in_view.a_rect.min, size)
+            );
+            assert_eq!(p.a_out, in_view.a_out);
+            assert!(!p.a_out_response);
+            g.view.scene_rect = SCREEN;
+            let p = pass(&mut g, vec![]);
+            assert!(p.a_ran);
+            assert!(p.a_out_response);
+        }
+
+        /// Out of view, `A` moves its sockets with it.
+        #[test]
+        fn out_of_view_node_moves_its_sockets() {
+            let (mut g, in_view) = test_graph(true);
+            g.view.scene_rect = panned();
+            pass(&mut g, vec![]);
+            let delta = egui::vec2(0.0, 50.0);
+            *g.view.layout.get_mut(&A).expect("A is laid out") += delta;
+            // The node position follows the layout one pass later.
+            pass(&mut g, vec![]);
+            let p = pass(&mut g, vec![]);
+            assert!(!p.a_ran);
+            let (pos, normal) = in_view.a_out.expect("A has an output");
+            assert_eq!(p.a_out, Some((pos + delta, normal)));
+        }
+
+        /// Out of view, a selected `A` is still removed on delete.
+        #[test]
+        fn out_of_view_node_is_removed() {
+            let (mut g, _) = test_graph(true);
+            g.view.scene_rect = panned();
+            g.selected = [A].into();
+            pass(&mut g, vec![]);
+            let delete = egui::Event::Key {
+                key: egui::Key::Delete,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let p = pass(&mut g, vec![delete]);
+            assert!(!p.a_ran);
+            assert!(p.a_removed);
+        }
+
+        /// Culling `A` does not change the egui ids of the nodes after it.
+        #[test]
+        fn culled_node_keeps_later_ids() {
+            let (mut g, in_view) = test_graph(true);
+            g.view.scene_rect = panned();
+            let p = pass(&mut g, vec![]);
+            assert!(!p.a_ran);
+            assert_eq!(p.b_content_id, in_view.b_content_id);
+        }
+
+        /// With [`Node::show`], `A` out of view runs its content and keeps its
+        /// sockets, but has no socket responses.
+        #[test]
+        fn out_of_view_node_without_cull_runs_content() {
+            let (mut g, in_view) = test_graph(false);
+            g.view.scene_rect = panned();
+            let p = pass(&mut g, vec![]);
+            assert!(p.a_ran);
+            assert_eq!(p.a_out, in_view.a_out);
+            assert!(!p.a_out_response);
+        }
+    }
 }
